@@ -1046,7 +1046,7 @@ impl<'a, R: Read + Seek> ValueChangeBlock<'a, R> {
                 } else {
                     match self.pack_type {
                         b'4' => lz4_decompress(reader, uncompressed_length)?,
-                        b'F' => todo!("FastLZ decompression of value change data"),
+                        b'F' => fastlz_decompress(reader, uncompressed_length)?,
                         // The C library treats anything else as zlib.
                         _ => zlib_decompress(reader, uncompressed_length)?,
                     }
@@ -1373,6 +1373,18 @@ fn real_to_f64(bytes: [u8; 8], endianness: RealEndianess) -> f64 {
         RealEndianess::LittleEndian => f64::from_le_bytes(bytes),
         RealEndianess::BigEndian => f64::from_be_bytes(bytes),
     }
+}
+
+/// Decompresses FastLZ data whose decompressed size must be `len`.
+fn fastlz_decompress(input: &[u8], len: u64) -> std::io::Result<Vec<u8>> {
+    let len = to_usize(len)?;
+    let mut output = vec![0u8; len];
+    let written = fastlz_rs::decompress_to_buf(input, &mut output)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    if written != len {
+        return Err(invalid_data("FastLZ data shorter than expected"));
+    }
+    Ok(output)
 }
 
 /// Decompresses zlib data whose decompressed size must be `len`.
@@ -2114,6 +2126,26 @@ mod tests {
 
         let next = iterator.next().unwrap().unwrap();
         assert_eq!(next.block_type(), Some(BlockType::Blackout));
+    }
+
+    #[test]
+    fn fastlz_waves() {
+        let mut changes = Vec::new();
+        for i in 0..100u64 {
+            changes.extend(varint(1 << 2 | (i & 1) << 1));
+        }
+        for level in [
+            fastlz_rs::CompressionLevel::Level1,
+            fastlz_rs::CompressionLevel::Level2,
+        ] {
+            let compressed = fastlz_rs::CompressState::new()
+                .compress_to_vec(&changes, level)
+                .unwrap();
+            assert!(compressed.len() < changes.len());
+            let decompressed = fastlz_decompress(&compressed, changes.len() as u64).unwrap();
+            assert_eq!(decompressed, changes);
+            assert!(fastlz_decompress(&compressed, changes.len() as u64 + 1).is_err());
+        }
     }
 
     #[test]

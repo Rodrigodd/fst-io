@@ -24,6 +24,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastlz-rs"
+version = "0.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aec3f2376b1a451070e235824e1d63d71663356dc117cd0d1cb7ae94cb5c3c09"
+
+[[package]]
 name = "flate2"
 version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -38,6 +44,7 @@ dependencies = [
 name = "fst-io"
 version = "0.1.0"
 dependencies = [
+ "fastlz-rs",
  "flate2",
  "lz4_flex",
 ]
