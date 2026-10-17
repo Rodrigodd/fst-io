@@ -362,7 +362,7 @@ impl<'a, R: Read> GeometryBlock<'a, R> {
     }
 
     /// Returns an iterator over the length of each variable.
-    fn lengths(self) -> GeometryLengths<'a, R> {
+    fn lengths(self) -> GeometryLengths<GeometryData<'a, R>> {
         let data = if self.is_compressed() {
             GeometryData::Zlib(ZlibDecoder::new(self.data))
         } else {
@@ -404,13 +404,13 @@ impl<R: Read> Read for GeometryData<'_, R> {
     }
 }
 
-struct GeometryLengths<'a, R> {
-    data: GeometryData<'a, R>,
+struct GeometryLengths<R> {
+    data: R,
     /// Entries not yet read.
     remaining: u64,
 }
 
-impl<R: Read> Iterator for GeometryLengths<'_, R> {
+impl<R: Read> Iterator for GeometryLengths<R> {
     type Item = std::io::Result<VariableLength>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -512,7 +512,7 @@ impl<'a, R: Read> HierarchyBlock<'a, R> {
     ///
     /// Gzip data is decompressed while iterating. LZ4 data can only be
     /// decompressed as a whole, so it is read and decompressed here.
-    fn entries(self) -> std::io::Result<HierarchyEntries<'a, R>> {
+    fn entries(self) -> std::io::Result<HierarchyEntries<HierarchyData<'a, R>>> {
         let data = match self.compression {
             HierarchyCompression::Gzip => {
                 HierarchyData::Gzip(std::io::BufReader::new(GzDecoder::new(self.data)))
@@ -698,15 +698,15 @@ impl std::fmt::Display for HierarchyEntry {
     }
 }
 
-struct HierarchyEntries<'a, R> {
-    data: HierarchyData<'a, R>,
+struct HierarchyEntries<R> {
+    data: R,
     /// ID of the next non-aliased variable.
     next_id: u64,
     /// Set at the end of the data or after an error.
     done: bool,
 }
 
-impl<R: Read> HierarchyEntries<'_, R> {
+impl<R: BufRead> HierarchyEntries<R> {
     fn read_entry(&mut self) -> std::io::Result<Option<HierarchyEntry>> {
         let tag = match self.data.fill_buf()?.first() {
             Some(&tag) => tag,
@@ -758,7 +758,7 @@ impl<R: Read> HierarchyEntries<'_, R> {
     }
 }
 
-impl<R: Read> Iterator for HierarchyEntries<'_, R> {
+impl<R: BufRead> Iterator for HierarchyEntries<R> {
     type Item = std::io::Result<HierarchyEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
