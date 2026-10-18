@@ -50,6 +50,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fst-tool"
+version = "0.1.0"
+dependencies = [
+ "fst-io",
+]
+
+[[package]]
 name = "lz4_flex"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

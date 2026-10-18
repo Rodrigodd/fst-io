@@ -5,118 +5,9 @@ use flate2::read::{GzDecoder, ZlibDecoder};
 #[cfg(test)]
 mod tests;
 
-fn main() -> std::io::Result<()> {
-    let file = std::env::args().nth(1).expect("Please provide a file path");
-
-    let file = std::fs::File::open(file).expect("Failed to open file");
-    let mut reader = std::io::BufReader::new(file);
-
-    // The geometry block comes after the value change blocks, but is needed to
-    // decode them, so the file is read twice.
-    let mut real_endianness = None;
-    let mut geometry_lengths = None;
-
-    let mut iterator = SectionIterator::new(&mut reader);
-
-    while let Some(section) = iterator.next()? {
-        println!("kind={} len={}", section.block_type, section.len());
-        match section.block_type() {
-            Some(BlockType::Header) => {
-                let header = section.read_header()?;
-                println!("Header: {:?}", header);
-                real_endianness = Some(header.real_endianness);
-            }
-            Some(BlockType::Geometry) => {
-                let geometry = section.read_geometry()?;
-                println!(
-                    "Geometry: count={} uncompressed_length={} compressed_length={}",
-                    geometry.count, geometry.uncompressed_length, geometry.compressed_length
-                );
-                let lengths = geometry.lengths().collect::<std::io::Result<Vec<_>>>()?;
-                for (i, length) in lengths.iter().take(10).enumerate() {
-                    println!("  [{i}] {:?}", length);
-                }
-                geometry_lengths = Some(lengths);
-            }
-            Some(BlockType::Hierarchy | BlockType::HierarchyLZ4 | BlockType::HierarchyLZ4Duo) => {
-                let hierarchy = section.read_hierarchy()?;
-                println!(
-                    "Hierarchy: compression={:?} uncompressed_length={}",
-                    hierarchy.compression, hierarchy.uncompressed_length
-                );
-                let mut depth = 0;
-                for entry in hierarchy.entries()?.take(20) {
-                    let entry = entry?;
-                    if let HierarchyEntry::UpScope = entry {
-                        depth -= 1;
-                    }
-                    println!("  {:indent$}{}", "", entry, indent = depth * 2);
-                    if let HierarchyEntry::Scope { .. } = entry {
-                        depth += 1;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let (Some(real_endianness), Some(lengths)) = (real_endianness, geometry_lengths) else {
-        println!("No header or geometry block, can't read value changes");
-        return Ok(());
-    };
-
-    reader.rewind()?;
-    let mut iterator = SectionIterator::new(&mut reader);
-    while let Some(section) = iterator.next()? {
-        if !matches!(
-            section.block_type(),
-            Some(
-                BlockType::ValueChangeData
-                    | BlockType::ValueChangeDataDynamicAlias
-                    | BlockType::ValueChangeDataDynamicAlias2
-            )
-        ) {
-            continue;
-        }
-
-        let mut block = section.read_value_changes()?;
-        let head = block.read_head_layout()?;
-        let tail = block.read_tail_layout()?;
-        let positions = block.read_positions(&head, &tail)?;
-        println!(
-            "ValueChange: type={:?} time={}..{} memory_required={} vars={} pack_type={:?} bits_count={} time_count={}",
-            block.block_type,
-            block.start_time,
-            block.end_time,
-            block.memory_required,
-            head.waves_count,
-            head.pack_type as char,
-            head.bits_count,
-            tail.time_count,
-        );
-
-        let times = block.read_time_table(&tail)?;
-        let bits = block.read_bits(&head)?;
-        for (id, value) in bits.values(&lengths).take(4).enumerate() {
-            println!("  initial [{id}] {}", value?.display(real_endianness));
-        }
-
-        for id in 0..lengths.len().min(4) as u64 {
-            let waves = block.read_waves(&head, &positions, id, lengths[id as usize])?;
-            for change in waves.iter().take(5) {
-                let (time_index, value) = change?;
-                let time = times[time_index as usize];
-                println!("  #{time} [{id}] {}", value.display(real_endianness));
-            }
-        }
-    }
-
-    Ok(())
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-enum BlockType {
+pub enum BlockType {
     /// Header block, found at the start of the file.
     ///
     /// FST_BL_HDR
@@ -169,11 +60,11 @@ enum BlockType {
 /// of the `read_*` methods) or to [`skip`](Section::skip) it. Dropping the
 /// section without fully reading it is also fine: the iterator skips whatever
 /// is left before reading the next section.
-struct Section<'a, R> {
-    block_type: u8,
-    len: u64,
+pub struct Section<'a, R> {
+    pub block_type: u8,
+    pub len: u64,
     /// The iterator's reader, limited to the remaining bytes of this section.
-    data: &'a mut Take<R>,
+    pub data: &'a mut Take<R>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -238,11 +129,11 @@ impl<R: Read> Read for Section<'_, R> {
 
 impl<R> Section<'_, R> {
     /// Length of the section data, in bytes (excluding block type and length fields).
-    fn len(&self) -> u64 {
+    pub fn len(&self) -> u64 {
         self.len
     }
 
-    fn block_type(&self) -> Option<BlockType> {
+    pub fn block_type(&self) -> Option<BlockType> {
         match self.block_type {
             0 => Some(BlockType::Header),
             1 => Some(BlockType::ValueChangeData),
@@ -262,7 +153,7 @@ impl<R> Section<'_, R> {
 
 impl<R: Read + Seek> Section<'_, R> {
     /// Reads the section as a header block.
-    fn read_header(mut self) -> std::io::Result<HeaderBlock> {
+    pub fn read_header(mut self) -> std::io::Result<HeaderBlock> {
         if self.block_type != BlockType::Header as u8 {
             return Err(invalid_data("section is not a header block"));
         }
@@ -329,7 +220,7 @@ impl<'a, R: Read> Section<'a, R> {
     ///
     /// Only the fixed size fields are read; the length entries are read lazily
     /// through [`GeometryBlock::lengths`].
-    fn read_geometry(mut self) -> std::io::Result<GeometryBlock<'a, R>> {
+    pub fn read_geometry(mut self) -> std::io::Result<GeometryBlock<'a, R>> {
         if self.block_type != BlockType::Geometry as u8 {
             return Err(invalid_data("section is not a geometry block"));
         }
@@ -350,25 +241,25 @@ impl<'a, R: Read> Section<'a, R> {
 }
 
 /// Geometry block: the length of each variable in bits.
-struct GeometryBlock<'a, R> {
+pub struct GeometryBlock<'a, R> {
     /// Length of the uncompressed data. Equal to `compressed_length` if the data
     /// is not compressed.
-    uncompressed_length: u64,
+    pub uncompressed_length: u64,
     /// Length of the (possibly compressed) data.
-    compressed_length: u64,
+    pub compressed_length: u64,
     /// Number of length entries in the data.
-    count: u64,
+    pub count: u64,
     /// The section reader, limited to the geometry data.
-    data: &'a mut Take<R>,
+    pub data: &'a mut Take<R>,
 }
 
 impl<'a, R: Read> GeometryBlock<'a, R> {
-    fn is_compressed(&self) -> bool {
+    pub fn is_compressed(&self) -> bool {
         self.uncompressed_length != self.compressed_length
     }
 
     /// Returns an iterator over the length of each variable.
-    fn lengths(self) -> GeometryLengths<GeometryData<'a, R>> {
+    pub fn lengths(self) -> GeometryLengths<GeometryData<'a, R>> {
         let data = if self.is_compressed() {
             GeometryData::Zlib(ZlibDecoder::new(self.data))
         } else {
@@ -384,7 +275,7 @@ impl<'a, R: Read> GeometryBlock<'a, R> {
 
 /// Length of a variable, as recorded in the geometry block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VariableLength {
+pub enum VariableLength {
     /// Length in bits.
     Bits(u64),
     /// A real variable (encoded as 0).
@@ -396,7 +287,7 @@ enum VariableLength {
 }
 
 /// The geometry data, decompressed if needed.
-enum GeometryData<'a, R> {
+pub enum GeometryData<'a, R> {
     Raw(&'a mut Take<R>),
     Zlib(ZlibDecoder<&'a mut Take<R>>),
 }
@@ -410,10 +301,10 @@ impl<R: Read> Read for GeometryData<'_, R> {
     }
 }
 
-struct GeometryLengths<R> {
-    data: R,
+pub struct GeometryLengths<R> {
+    pub data: R,
     /// Entries not yet read.
-    remaining: u64,
+    pub remaining: u64,
 }
 
 impl<R: Read> Iterator for GeometryLengths<R> {
@@ -469,7 +360,7 @@ impl<'a, R: Read> Section<'a, R> {
     ///
     /// Only the fixed size fields are read; the entries are decompressed and
     /// read by [`HierarchyBlock::entries`].
-    fn read_hierarchy(mut self) -> std::io::Result<HierarchyBlock<'a, R>> {
+    pub fn read_hierarchy(mut self) -> std::io::Result<HierarchyBlock<'a, R>> {
         let mut uncompressed_length = [0u8; 8];
         self.read_exact(&mut uncompressed_length)?;
         let uncompressed_length = u64::from_be_bytes(uncompressed_length);
@@ -492,7 +383,7 @@ impl<'a, R: Read> Section<'a, R> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HierarchyCompression {
+pub enum HierarchyCompression {
     /// FST_BL_HIER
     Gzip,
     /// FST_BL_HIER_LZ4
@@ -505,12 +396,12 @@ enum HierarchyCompression {
 }
 
 /// Hierarchy block: the design hierarchy and all signal names.
-struct HierarchyBlock<'a, R> {
-    compression: HierarchyCompression,
+pub struct HierarchyBlock<'a, R> {
+    pub compression: HierarchyCompression,
     /// Length of the hierarchy data after decompression.
-    uncompressed_length: u64,
+    pub uncompressed_length: u64,
     /// The section reader, limited to the compressed hierarchy data.
-    data: &'a mut Take<R>,
+    pub data: &'a mut Take<R>,
 }
 
 impl<'a, R: Read> HierarchyBlock<'a, R> {
@@ -518,7 +409,7 @@ impl<'a, R: Read> HierarchyBlock<'a, R> {
     ///
     /// Gzip data is decompressed while iterating. LZ4 data can only be
     /// decompressed as a whole, so it is read and decompressed here.
-    fn entries(self) -> std::io::Result<HierarchyEntries<HierarchyData<'a, R>>> {
+    pub fn entries(self) -> std::io::Result<HierarchyEntries<HierarchyData<'a, R>>> {
         let data = match self.compression {
             HierarchyCompression::Gzip => {
                 HierarchyData::Gzip(std::io::BufReader::new(GzDecoder::new(self.data)))
@@ -569,7 +460,7 @@ fn lz4_decompress(input: &[u8], len: u64) -> std::io::Result<Vec<u8>> {
 }
 
 /// The hierarchy data, after decompression.
-enum HierarchyData<'a, R> {
+pub enum HierarchyData<'a, R> {
     Gzip(std::io::BufReader<GzDecoder<&'a mut Take<R>>>),
     Buffer(std::io::Cursor<Vec<u8>>),
 }
@@ -616,7 +507,7 @@ const VAR_TYPE_PORT: u8 = 18;
 ///
 /// Names are kept as raw bytes, since they are not guaranteed to be UTF-8.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum HierarchyEntry {
+pub enum HierarchyEntry {
     /// FST_ST_GEN_ATTRBEGIN: begins an attribute for the current scope.
     AttributeBegin {
         /// See FST_AT_*.
@@ -704,16 +595,16 @@ impl std::fmt::Display for HierarchyEntry {
     }
 }
 
-struct HierarchyEntries<R> {
-    data: R,
+pub struct HierarchyEntries<R> {
+    pub data: R,
     /// ID of the next non-aliased variable.
-    next_id: u64,
+    pub next_id: u64,
     /// Set at the end of the data or after an error.
-    done: bool,
+    pub done: bool,
 }
 
 impl<R: BufRead> HierarchyEntries<R> {
-    fn read_entry(&mut self) -> std::io::Result<Option<HierarchyEntry>> {
+    pub fn read_entry(&mut self) -> std::io::Result<Option<HierarchyEntry>> {
         let tag = match self.data.fill_buf()?.first() {
             Some(&tag) => tag,
             None => return Ok(None),
@@ -801,7 +692,7 @@ impl<'a, R: Read + Seek> Section<'a, R> {
     /// Reads only the fixed size fields at the start of the section. The
     /// tables are located by [`ValueChangeBlock::read_head_layout`] and
     /// [`ValueChangeBlock::read_tail_layout`], and read on demand.
-    fn read_value_changes(mut self) -> std::io::Result<ValueChangeBlock<'a, R>> {
+    pub fn read_value_changes(mut self) -> std::io::Result<ValueChangeBlock<'a, R>> {
         let block_type = match self.block_type() {
             Some(
                 block_type @ (BlockType::ValueChangeData
@@ -837,54 +728,54 @@ impl<'a, R: Read + Seek> Section<'a, R> {
 /// The block holds no derived state. The caller locates the tables with
 /// [`HeadLayout`] and [`TailLayout`], and passes them to the methods that read
 /// the tables.
-struct ValueChangeBlock<'a, R> {
-    block_type: BlockType,
+pub struct ValueChangeBlock<'a, R> {
+    pub block_type: BlockType,
     /// Start time of the block, in units of the header timescale.
-    start_time: u64,
-    end_time: u64,
+    pub start_time: u64,
+    pub end_time: u64,
     /// Buffer memory required for a full traversal of the block.
-    memory_required: u64,
+    pub memory_required: u64,
 
     /// Length of the section data.
-    len: u64,
+    pub len: u64,
     /// The section reader.
-    data: &'a mut Take<R>,
+    pub data: &'a mut Take<R>,
 }
 
 /// Fields of a value change block located by seeking from the start of the
 /// section. Offsets are relative to the start of the section data.
 #[derive(Debug, Clone, Copy)]
-struct HeadLayout {
-    bits_start: u64,
-    bits_uncompressed_length: u64,
+pub struct HeadLayout {
+    pub bits_start: u64,
+    pub bits_uncompressed_length: u64,
     /// Equal to `bits_uncompressed_length` if not compressed.
-    bits_compressed_length: u64,
+    pub bits_compressed_length: u64,
     /// Number of variables in the bits array.
-    bits_count: u64,
+    pub bits_count: u64,
     /// Number of variables in the position table.
-    waves_count: u64,
+    pub waves_count: u64,
     /// Offset of the pack type byte. Wave positions are relative to it.
-    waves_start: u64,
+    pub waves_start: u64,
     /// Compression of the waves: b'Z' (zlib), b'F' (FastLZ) or b'4' (LZ4).
-    pack_type: u8,
+    pub pack_type: u8,
 }
 
 /// Fields of a value change block located by seeking from the end of the
 /// section. Offsets are relative to the start of the section data.
 #[derive(Debug, Clone, Copy)]
-struct TailLayout {
-    positions_start: u64,
-    time_start: u64,
-    time_uncompressed_length: u64,
+pub struct TailLayout {
+    pub positions_start: u64,
+    pub time_start: u64,
+    pub time_uncompressed_length: u64,
     /// Equal to `time_uncompressed_length` if not compressed.
-    time_compressed_length: u64,
+    pub time_compressed_length: u64,
     /// Number of entries in the time table.
-    time_count: u64,
+    pub time_count: u64,
 }
 
 /// Where the waves of a variable are, as decoded from the position table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WavePosition {
+pub enum WavePosition {
     /// The variable has no value changes in this block.
     None,
     /// The waves are at `offset` from the pack type byte, and are `length`
@@ -925,7 +816,7 @@ impl<'a, R: Read + Seek> ValueChangeBlock<'a, R> {
 
     /// Locates the tables at the start of the section: the bits array and the
     /// waves.
-    fn read_head_layout(&mut self) -> std::io::Result<HeadLayout> {
+    pub fn read_head_layout(&mut self) -> std::io::Result<HeadLayout> {
         // The fixed size fields, read by `read_value_changes`, come first.
         self.seek_to(24)?;
         let bits_uncompressed_length = read_varint(self.data)?;
@@ -951,7 +842,7 @@ impl<'a, R: Read + Seek> ValueChangeBlock<'a, R> {
 
     /// Locates the tables at the end of the section: the position table and
     /// the time table.
-    fn read_tail_layout(&mut self) -> std::io::Result<TailLayout> {
+    pub fn read_tail_layout(&mut self) -> std::io::Result<TailLayout> {
         // The time table trailer is at the end of the section.
         let trailer_start = self
             .len
@@ -990,7 +881,7 @@ impl<'a, R: Read + Seek> ValueChangeBlock<'a, R> {
     }
 
     /// Reads the bits array: the value of each variable at `start_time`.
-    fn read_bits(&mut self, head: &HeadLayout) -> std::io::Result<BitsArray> {
+    pub fn read_bits(&mut self, head: &HeadLayout) -> std::io::Result<BitsArray> {
         let data = self.read_at(head.bits_start, head.bits_compressed_length)?;
         let data = if head.bits_compressed_length != head.bits_uncompressed_length {
             zlib_decompress(&data, head.bits_uncompressed_length)?
@@ -1004,7 +895,7 @@ impl<'a, R: Read + Seek> ValueChangeBlock<'a, R> {
     }
 
     /// Reads the time table, returning the time of each time index.
-    fn read_time_table(&mut self, tail: &TailLayout) -> std::io::Result<Vec<u64>> {
+    pub fn read_time_table(&mut self, tail: &TailLayout) -> std::io::Result<Vec<u64>> {
         let data = self.read_at(tail.time_start, tail.time_compressed_length)?;
         let data = if tail.time_compressed_length != tail.time_uncompressed_length {
             zlib_decompress(&data, tail.time_uncompressed_length)?
@@ -1027,7 +918,7 @@ impl<'a, R: Read + Seek> ValueChangeBlock<'a, R> {
     /// Reads the position table.
     ///
     /// Has `waves_count` entries, one for each variable.
-    fn read_positions(
+    pub fn read_positions(
         &mut self,
         head: &HeadLayout,
         tail: &TailLayout,
@@ -1051,7 +942,7 @@ impl<'a, R: Read + Seek> ValueChangeBlock<'a, R> {
     ///
     /// `positions` is the table from [`Self::read_positions`]. `length` is the
     /// variable length from the geometry block, needed to decode the waves.
-    fn read_waves(
+    pub fn read_waves(
         &mut self,
         head: &HeadLayout,
         positions: &[WavePosition],
@@ -1156,7 +1047,7 @@ fn decode_positions_alias2(
 }
 
 /// A decoded position table entry, before the wave lengths are known.
-enum PositionEntry {
+pub enum PositionEntry {
     /// A run of variables without value changes.
     Zeros(u64),
     /// Offset of the waves, relative to the pack type byte.
@@ -1226,17 +1117,17 @@ fn end_last_data(
 }
 
 /// The bits array: the value of each variable at the start of the block.
-struct BitsArray {
-    data: Vec<u8>,
+pub struct BitsArray {
+    pub data: Vec<u8>,
     /// Number of variables.
-    count: u64,
+    pub count: u64,
 }
 
 impl BitsArray {
     /// Returns the value of each variable, given the variable lengths from the
     /// geometry block. Variable length values are not stored, and are returned
     /// as `None`.
-    fn values<'a>(
+    pub fn values<'a>(
         &'a self,
         lengths: &'a [VariableLength],
     ) -> impl Iterator<Item = std::io::Result<Value<'a>>> + 'a {
@@ -1263,17 +1154,17 @@ impl BitsArray {
 }
 
 /// The value changes of one variable in a block.
-struct Waves {
+pub struct Waves {
     /// Decompressed waves.
-    data: Vec<u8>,
+    pub data: Vec<u8>,
     /// Variable length, from the geometry block.
-    length: VariableLength,
+    pub length: VariableLength,
 }
 
 impl Waves {
     /// Returns the value changes, as `(time_index, value)` pairs. The time
     /// index is an index into the time table.
-    fn iter(&self) -> WavesIter<'_> {
+    pub fn iter(&self) -> WavesIter<'_> {
         WavesIter {
             data: &self.data,
             length: self.length,
@@ -1282,17 +1173,17 @@ impl Waves {
     }
 }
 
-struct WavesIter<'a> {
-    data: &'a [u8],
-    length: VariableLength,
-    time_index: u64,
+pub struct WavesIter<'a> {
+    pub data: &'a [u8],
+    pub length: VariableLength,
+    pub time_index: u64,
 }
 
 /// FST_RCV_STR: values of 1-bit variables other than 0 and 1.
 const ONE_BIT_VALUES: &[u8; 8] = b"xzhuwl-?";
 
 impl<'a> WavesIter<'a> {
-    fn read_change(&mut self) -> std::io::Result<(u64, Value<'a>)> {
+    pub fn read_change(&mut self) -> std::io::Result<(u64, Value<'a>)> {
         let header = read_varint(&mut self.data)?;
 
         let (delta, value) = match self.length {
@@ -1337,7 +1228,7 @@ impl<'a> WavesIter<'a> {
         Ok((self.time_index, value))
     }
 
-    fn take(&mut self, len: usize) -> std::io::Result<&'a [u8]> {
+    pub fn take(&mut self, len: usize) -> std::io::Result<&'a [u8]> {
         if self.data.len() < len {
             return Err(std::io::ErrorKind::UnexpectedEof.into());
         }
@@ -1365,7 +1256,7 @@ impl<'a> Iterator for WavesIter<'a> {
 
 /// A variable value, as encoded in the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Value<'a> {
+pub enum Value<'a> {
     /// A 1-bit value, as ASCII: b'0', b'1', b'x', b'z', b'h', b'u', b'w', b'l',
     /// b'-' or b'?'.
     Bit(u8),
@@ -1383,7 +1274,7 @@ enum Value<'a> {
 impl Value<'_> {
     /// Returns the value with one ASCII character per bit. For reals and
     /// variable length values, returns the raw bytes.
-    fn to_ascii(&self) -> Vec<u8> {
+    pub fn to_ascii(&self) -> Vec<u8> {
         match *self {
             Value::Bit(bit) => vec![bit],
             Value::Packed { data, bits } => (0..bits)
@@ -1396,7 +1287,7 @@ impl Value<'_> {
 
     /// Returns a value that can be displayed, decoding reals with the given
     /// endianness.
-    fn display(&self, endianness: RealEndianess) -> String {
+    pub fn display(&self, endianness: RealEndianess) -> String {
         match *self {
             Value::Real(bytes) => format!("{}", real_to_f64(bytes, endianness)),
             _ => String::from_utf8_lossy(&self.to_ascii()).into_owned(),
@@ -1482,13 +1373,13 @@ fn skip_remaining<R: Seek>(reader: &mut Take<R>) -> std::io::Result<()> {
     Ok(())
 }
 
-struct SectionIterator<R: Read + Seek> {
+pub struct SectionIterator<R: Read + Seek> {
     /// Limited to the bytes left unread in the last returned section.
-    reader: Take<R>,
+    pub reader: Take<R>,
 }
 
 impl<R: Read + Seek> SectionIterator<R> {
-    fn new(reader: R) -> Self {
+    pub fn new(reader: R) -> Self {
         Self {
             reader: reader.take(0),
         }
@@ -1497,7 +1388,7 @@ impl<R: Read + Seek> SectionIterator<R> {
     /// Returns the next section, or `None` at end of file.
     ///
     /// Any data left unread in the previous section is skipped first.
-    fn next(&mut self) -> std::io::Result<Option<Section<'_, R>>> {
+    pub fn next(&mut self) -> std::io::Result<Option<Section<'_, R>>> {
         skip_remaining(&mut self.reader)?;
         let reader = self.reader.get_mut();
 
