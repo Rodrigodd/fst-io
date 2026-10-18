@@ -189,7 +189,7 @@ fn info_hierarchy(input: &Path, flat: bool, names: bool) -> std::io::Result<()> 
                             let blank = id_width + 1 + 1 + 7;
                             let scope_type = scope_type_name(scope_type)
                                 .map_or_else(|| format!("scope={scope_type}"), str::to_string);
-                            writeln!(out, "{:blank$} {scope_type:<8} {:indent$}{name}", "", "")?;
+                            writeln!(out, "{:indent$}{:blank$} {scope_type:<8} {name}", "", "")?;
                         }
                     }
                     scopes.push(name);
@@ -206,14 +206,15 @@ fn info_hierarchy(input: &Path, flat: bool, names: bool) -> std::io::Result<()> 
                     is_alias,
                 } => {
                     let name = String::from_utf8_lossy(&name);
-                    let name = if flat {
+                    // In the tree the whole line is indented, not only the name.
+                    let (indent, name) = if flat {
                         let path: String = scopes.iter().map(|s| format!("{s}.")).collect();
-                        format!("{path}{name}")
+                        (0, format!("{path}{name}"))
                     } else {
-                        format!("{:indent$}{name}", "", indent = scopes.len() * 2)
+                        (scopes.len() * 2, name.into_owned())
                     };
                     if names {
-                        writeln!(out, "{name}")?;
+                        writeln!(out, "{:indent$}{name}", "")?;
                         continue;
                     }
 
@@ -223,7 +224,8 @@ fn info_hierarchy(input: &Path, flat: bool, names: bool) -> std::io::Result<()> 
                         .map_or_else(|| format!("type={var_type}"), str::to_string);
                     writeln!(
                         out,
-                        "{id:<id_width$}{marker} {direction:<7} {var_type:<8} {name} ({length})"
+                        "{:indent$}{id:<id_width$}{marker} {direction:<7} {var_type:<8} {name} ({length})",
+                        ""
                     )?;
                 }
                 HierarchyEntry::AttributeBegin { .. } | HierarchyEntry::AttributeEnd => {}
