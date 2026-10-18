@@ -77,26 +77,29 @@ fn main() -> std::io::Result<()> {
         }
 
         let mut block = section.read_value_changes()?;
+        let head = block.read_head_layout()?;
+        let tail = block.read_tail_layout()?;
+        let positions = block.read_positions(&head, &tail)?;
         println!(
             "ValueChange: type={:?} time={}..{} memory_required={} vars={} pack_type={:?} bits_count={} time_count={}",
             block.block_type,
             block.start_time,
             block.end_time,
             block.memory_required,
-            block.waves_count,
-            block.pack_type as char,
-            block.bits_count,
-            block.time_count,
+            head.waves_count,
+            head.pack_type as char,
+            head.bits_count,
+            tail.time_count,
         );
 
-        let times = block.read_time_table()?;
-        let bits = block.read_bits()?;
+        let times = block.read_time_table(&tail)?;
+        let bits = block.read_bits(&head)?;
         for (id, value) in bits.values(&lengths).take(4).enumerate() {
             println!("  initial [{id}] {}", value?.display(real_endianness));
         }
 
         for id in 0..lengths.len().min(4) as u64 {
-            let waves = block.waves(id, lengths[id as usize])?;
+            let waves = block.read_waves(&head, &positions, id, lengths[id as usize])?;
             for change in waves.iter().take(5) {
                 let (time_index, value) = change?;
                 let time = times[time_index as usize];
@@ -792,8 +795,9 @@ fn read_name<R: BufRead>(reader: &mut R) -> std::io::Result<Vec<u8>> {
 impl<'a, R: Read + Seek> Section<'a, R> {
     /// Reads the section as a value change block.
     ///
-    /// Reads the fixed size fields and the trailers at the end of the section,
-    /// which locate the tables. The tables are read on demand.
+    /// Reads only the fixed size fields at the start of the section. The
+    /// tables are located by [`ValueChangeBlock::read_head_layout`] and
+    /// [`ValueChangeBlock::read_tail_layout`], and read on demand.
     fn read_value_changes(mut self) -> std::io::Result<ValueChangeBlock<'a, R>> {
         let block_type = match self.block_type() {
             Some(
@@ -810,69 +814,14 @@ impl<'a, R: Read + Seek> Section<'a, R> {
         let end_time = u64::from_be_bytes(fields[8..16].try_into().unwrap());
         let memory_required = u64::from_be_bytes(fields[16..24].try_into().unwrap());
 
-        let bits_uncompressed_length = read_varint(&mut self)?;
-        let bits_compressed_length = read_varint(&mut self)?;
-        let bits_count = read_varint(&mut self)?;
-
-        let mut block = ValueChangeBlock {
+        Ok(ValueChangeBlock {
             block_type,
             start_time,
             end_time,
             memory_required,
-            bits_uncompressed_length,
-            bits_compressed_length,
-            bits_count,
-            waves_count: 0,
-            pack_type: 0,
-            time_uncompressed_length: 0,
-            time_compressed_length: 0,
-            time_count: 0,
-            bits_start: 0,
-            waves_start: 0,
-            positions_start: 0,
-            time_start: 0,
-            positions: None,
             len: self.len,
             data: self.data,
-        };
-
-        block.bits_start = block.position();
-        block.seek_to(checked_add(block.bits_start, bits_compressed_length)?)?;
-        block.waves_count = read_varint(block.data)?;
-        block.waves_start = block.position();
-        block.pack_type = read_u8(block.data)?;
-
-        // The time table trailer is at the end of the section.
-        let trailer_start = block
-            .len
-            .checked_sub(24)
-            .ok_or_else(|| invalid_data("value change block too short"))?;
-        block.seek_to(trailer_start)?;
-        let mut trailer = [0u8; 24];
-        block.data.read_exact(&mut trailer)?;
-        block.time_uncompressed_length = u64::from_be_bytes(trailer[0..8].try_into().unwrap());
-        block.time_compressed_length = u64::from_be_bytes(trailer[8..16].try_into().unwrap());
-        block.time_count = u64::from_be_bytes(trailer[16..24].try_into().unwrap());
-
-        // The position table length is just before the time table.
-        block.time_start = trailer_start
-            .checked_sub(block.time_compressed_length)
-            .ok_or_else(|| invalid_data("time table larger than block"))?;
-        let positions_length_start = block
-            .time_start
-            .checked_sub(8)
-            .ok_or_else(|| invalid_data("time table larger than block"))?;
-        block.seek_to(positions_length_start)?;
-        let mut positions_length = [0u8; 8];
-        block.data.read_exact(&mut positions_length)?;
-        let positions_length = u64::from_be_bytes(positions_length);
-
-        block.positions_start = positions_length_start
-            .checked_sub(positions_length)
-            .filter(|&start| start > block.waves_start)
-            .ok_or_else(|| invalid_data("position table larger than block"))?;
-
-        Ok(block)
+        })
     }
 }
 
@@ -881,6 +830,10 @@ impl<'a, R: Read + Seek> Section<'a, R> {
 /// Contains four tables, read on demand: the bits array (values at
 /// `start_time`), the waves (the value changes of each variable), the position
 /// table (where the waves of each variable are) and the time table.
+///
+/// The block holds no derived state. The caller locates the tables with
+/// [`HeadLayout`] and [`TailLayout`], and passes them to the methods that read
+/// the tables.
 struct ValueChangeBlock<'a, R> {
     block_type: BlockType,
     /// Start time of the block, in units of the header timescale.
@@ -888,6 +841,18 @@ struct ValueChangeBlock<'a, R> {
     end_time: u64,
     /// Buffer memory required for a full traversal of the block.
     memory_required: u64,
+
+    /// Length of the section data.
+    len: u64,
+    /// The section reader.
+    data: &'a mut Take<R>,
+}
+
+/// Fields of a value change block located by seeking from the start of the
+/// section. Offsets are relative to the start of the section data.
+#[derive(Debug, Clone, Copy)]
+struct HeadLayout {
+    bits_start: u64,
     bits_uncompressed_length: u64,
     /// Equal to `bits_uncompressed_length` if not compressed.
     bits_compressed_length: u64,
@@ -895,28 +860,23 @@ struct ValueChangeBlock<'a, R> {
     bits_count: u64,
     /// Number of variables in the position table.
     waves_count: u64,
+    /// Offset of the pack type byte. Wave positions are relative to it.
+    waves_start: u64,
     /// Compression of the waves: b'Z' (zlib), b'F' (FastLZ) or b'4' (LZ4).
     pack_type: u8,
+}
+
+/// Fields of a value change block located by seeking from the end of the
+/// section. Offsets are relative to the start of the section data.
+#[derive(Debug, Clone, Copy)]
+struct TailLayout {
+    positions_start: u64,
+    time_start: u64,
     time_uncompressed_length: u64,
     /// Equal to `time_uncompressed_length` if not compressed.
     time_compressed_length: u64,
     /// Number of entries in the time table.
     time_count: u64,
-
-    // Offsets of the tables, relative to the start of the section data.
-    bits_start: u64,
-    /// Offset of the pack type byte. Wave positions are relative to it.
-    waves_start: u64,
-    positions_start: u64,
-    time_start: u64,
-
-    /// The decoded position table, read on first use.
-    positions: Option<Vec<WavePosition>>,
-
-    /// Length of the section data.
-    len: u64,
-    /// The section reader.
-    data: &'a mut Take<R>,
 }
 
 /// Where the waves of a variable are, as decoded from the position table.
@@ -960,33 +920,99 @@ impl<'a, R: Read + Seek> ValueChangeBlock<'a, R> {
         Ok(data)
     }
 
+    /// Locates the tables at the start of the section: the bits array and the
+    /// waves.
+    fn read_head_layout(&mut self) -> std::io::Result<HeadLayout> {
+        // The fixed size fields, read by `read_value_changes`, come first.
+        self.seek_to(24)?;
+        let bits_uncompressed_length = read_varint(self.data)?;
+        let bits_compressed_length = read_varint(self.data)?;
+        let bits_count = read_varint(self.data)?;
+
+        let bits_start = self.position();
+        self.seek_to(checked_add(bits_start, bits_compressed_length)?)?;
+        let waves_count = read_varint(self.data)?;
+        let waves_start = self.position();
+        let pack_type = read_u8(self.data)?;
+
+        Ok(HeadLayout {
+            bits_start,
+            bits_uncompressed_length,
+            bits_compressed_length,
+            bits_count,
+            waves_count,
+            waves_start,
+            pack_type,
+        })
+    }
+
+    /// Locates the tables at the end of the section: the position table and
+    /// the time table.
+    fn read_tail_layout(&mut self) -> std::io::Result<TailLayout> {
+        // The time table trailer is at the end of the section.
+        let trailer_start = self
+            .len
+            .checked_sub(24)
+            .ok_or_else(|| invalid_data("value change block too short"))?;
+        self.seek_to(trailer_start)?;
+        let mut trailer = [0u8; 24];
+        self.data.read_exact(&mut trailer)?;
+        let time_uncompressed_length = u64::from_be_bytes(trailer[0..8].try_into().unwrap());
+        let time_compressed_length = u64::from_be_bytes(trailer[8..16].try_into().unwrap());
+        let time_count = u64::from_be_bytes(trailer[16..24].try_into().unwrap());
+
+        // The position table length is just before the time table.
+        let time_start = trailer_start
+            .checked_sub(time_compressed_length)
+            .ok_or_else(|| invalid_data("time table larger than block"))?;
+        let positions_length_start = time_start
+            .checked_sub(8)
+            .ok_or_else(|| invalid_data("time table larger than block"))?;
+        self.seek_to(positions_length_start)?;
+        let mut positions_length = [0u8; 8];
+        self.data.read_exact(&mut positions_length)?;
+        let positions_length = u64::from_be_bytes(positions_length);
+
+        let positions_start = positions_length_start
+            .checked_sub(positions_length)
+            .ok_or_else(|| invalid_data("position table larger than block"))?;
+
+        Ok(TailLayout {
+            positions_start,
+            time_start,
+            time_uncompressed_length,
+            time_compressed_length,
+            time_count,
+        })
+    }
+
     /// Reads the bits array: the value of each variable at `start_time`.
-    fn read_bits(&mut self) -> std::io::Result<BitsArray> {
-        let data = self.read_at(self.bits_start, self.bits_compressed_length)?;
-        let data = if self.bits_compressed_length != self.bits_uncompressed_length {
-            zlib_decompress(&data, self.bits_uncompressed_length)?
+    fn read_bits(&mut self, head: &HeadLayout) -> std::io::Result<BitsArray> {
+        let data = self.read_at(head.bits_start, head.bits_compressed_length)?;
+        let data = if head.bits_compressed_length != head.bits_uncompressed_length {
+            zlib_decompress(&data, head.bits_uncompressed_length)?
         } else {
             data
         };
         Ok(BitsArray {
             data,
-            count: self.bits_count,
+            count: head.bits_count,
         })
     }
 
     /// Reads the time table, returning the time of each time index.
-    fn read_time_table(&mut self) -> std::io::Result<Vec<u64>> {
-        let data = self.read_at(self.time_start, self.time_compressed_length)?;
-        let data = if self.time_compressed_length != self.time_uncompressed_length {
-            zlib_decompress(&data, self.time_uncompressed_length)?
+    fn read_time_table(&mut self, tail: &TailLayout) -> std::io::Result<Vec<u64>> {
+        let data = self.read_at(tail.time_start, tail.time_compressed_length)?;
+        let data = if tail.time_compressed_length != tail.time_uncompressed_length {
+            zlib_decompress(&data, tail.time_uncompressed_length)?
         } else {
             data
         };
 
         let mut reader = &data[..];
         let mut time = 0u64;
-        let mut times = Vec::with_capacity(to_usize(self.time_count)?.min(data.len()));
-        for _ in 0..self.time_count {
+        let mut times = Vec::with_capacity(to_usize(tail.time_count)?.min(data.len()));
+        for _ in 0..tail.time_count {
             time = time
                 .checked_add(read_varint(&mut reader)?)
                 .ok_or_else(|| invalid_data("time overflows u64"))?;
@@ -995,33 +1021,40 @@ impl<'a, R: Read + Seek> ValueChangeBlock<'a, R> {
         Ok(times)
     }
 
-    /// Returns the position table, reading it on first use.
+    /// Reads the position table.
     ///
     /// Has `waves_count` entries, one for each variable.
-    fn positions(&mut self) -> std::io::Result<&[WavePosition]> {
-        if self.positions.is_none() {
-            let length = self.time_start - 8 - self.positions_start;
-            let data = self.read_at(self.positions_start, length)?;
-            let waves_end = self.positions_start - self.waves_start;
-            let positions = match self.block_type {
-                BlockType::ValueChangeDataDynamicAlias2 => {
-                    decode_positions_alias2(&data, self.waves_count, waves_end)?
-                }
-                _ => decode_positions(&data, self.waves_count, waves_end)?,
-            };
-            self.positions = Some(positions);
+    fn read_positions(
+        &mut self,
+        head: &HeadLayout,
+        tail: &TailLayout,
+    ) -> std::io::Result<Vec<WavePosition>> {
+        if tail.positions_start <= head.waves_start {
+            return Err(invalid_data("position table larger than block"));
         }
-        Ok(self.positions.as_deref().unwrap())
+        let length = tail.time_start - 8 - tail.positions_start;
+        let data = self.read_at(tail.positions_start, length)?;
+        let waves_end = tail.positions_start - head.waves_start;
+        match self.block_type {
+            BlockType::ValueChangeDataDynamicAlias2 => {
+                decode_positions_alias2(&data, head.waves_count, waves_end)
+            }
+            _ => decode_positions(&data, head.waves_count, waves_end),
+        }
     }
 
     /// Reads and decompresses the waves of variable `id`, following dynamic
     /// aliases.
     ///
-    /// `length` is the variable length from the geometry block, needed to
-    /// decode the waves.
-    fn waves(&mut self, id: u64, length: VariableLength) -> std::io::Result<Waves> {
-        let positions = self.positions()?;
-
+    /// `positions` is the table from [`Self::read_positions`]. `length` is the
+    /// variable length from the geometry block, needed to decode the waves.
+    fn read_waves(
+        &mut self,
+        head: &HeadLayout,
+        positions: &[WavePosition],
+        id: u64,
+        length: VariableLength,
+    ) -> std::io::Result<Waves> {
         let mut position = *positions
             .get(to_usize(id)?)
             .ok_or_else(|| invalid_data("variable id out of range"))?;
@@ -1038,13 +1071,13 @@ impl<'a, R: Read + Seek> ValueChangeBlock<'a, R> {
         let data = match position {
             WavePosition::None | WavePosition::Alias(_) => Vec::new(),
             WavePosition::Data { offset, length } => {
-                let raw = self.read_at(self.waves_start + offset, length)?;
+                let raw = self.read_at(head.waves_start + offset, length)?;
                 let mut reader = &raw[..];
                 let uncompressed_length = read_varint(&mut reader)?;
                 if uncompressed_length == 0 {
                     reader.to_vec()
                 } else {
-                    match self.pack_type {
+                    match head.pack_type {
                         b'4' => lz4_decompress(reader, uncompressed_length)?,
                         b'F' => fastlz_decompress(reader, uncompressed_length)?,
                         // The C library treats anything else as zlib.
@@ -2082,14 +2115,20 @@ mod tests {
         assert_eq!(block.start_time, 10);
         assert_eq!(block.end_time, 22);
         assert_eq!(block.memory_required, 64);
-        assert_eq!(block.waves_count, 4);
-        assert_eq!(block.pack_type, b'Z');
 
         // Read the tables out of order, to exercise seeking.
-        assert_eq!(block.read_time_table().unwrap(), [10, 15, 22]);
+        let tail = block.read_tail_layout().unwrap();
+        let head = block.read_head_layout().unwrap();
+        assert_eq!(head.waves_count, 4);
+        assert_eq!(head.pack_type, b'Z');
+        assert_eq!(tail.time_count, 3);
+        assert_eq!(block.read_time_table(&tail).unwrap(), [10, 15, 22]);
 
+        let positions = block.read_positions(&head, &tail).unwrap();
         let changes = |block: &mut ValueChangeBlock<_>, id: u64| -> Vec<(u64, Vec<u8>)> {
-            let waves = block.waves(id, lengths[id as usize]).unwrap();
+            let waves = block
+                .read_waves(&head, &positions, id, lengths[id as usize])
+                .unwrap();
             waves
                 .iter()
                 .map(|change| {
@@ -2107,7 +2146,7 @@ mod tests {
         assert_eq!(changes(&mut block, 2), expected1);
         assert_eq!(changes(&mut block, 3), []);
 
-        let bits = block.read_bits().unwrap();
+        let bits = block.read_bits(&head).unwrap();
         let values: Vec<_> = bits
             .values(&lengths)
             .map(|v| v.unwrap().to_ascii())
@@ -2122,7 +2161,7 @@ mod tests {
             ]
         );
 
-        assert_eq!(block.positions().unwrap()[2], WavePosition::Alias(1));
+        assert_eq!(positions[2], WavePosition::Alias(1));
 
         let next = iterator.next().unwrap().unwrap();
         assert_eq!(next.block_type(), Some(BlockType::Blackout));
@@ -2156,13 +2195,12 @@ mod tests {
         // Time table compressed length larger than the block.
         file[trailer + 8..trailer + 16].copy_from_slice(&u64::MAX.to_be_bytes());
         let mut iterator = SectionIterator::new(std::io::Cursor::new(file));
-        assert!(
-            iterator
-                .next()
-                .unwrap()
-                .unwrap()
-                .read_value_changes()
-                .is_err()
-        );
+        let mut block = iterator
+            .next()
+            .unwrap()
+            .unwrap()
+            .read_value_changes()
+            .unwrap();
+        assert!(block.read_tail_layout().is_err());
     }
 }
