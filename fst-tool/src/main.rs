@@ -1,7 +1,7 @@
 use std::io::{BufReader, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use fst_io::*;
 
 #[derive(Parser)]
@@ -17,6 +17,21 @@ enum Command {
     Dump {
         /// The FST file to read.
         input: PathBuf,
+    },
+    /// Print information about a file.
+    ///
+    /// At least one of the options must be given, otherwise this help is
+    /// printed.
+    Info {
+        /// The FST file to read.
+        input: PathBuf,
+        /// Print the full hierarchy: scopes and variables.
+        #[arg(long)]
+        hier: bool,
+        /// Print each variable on its own line with its full dotted path,
+        /// instead of an indented tree.
+        #[arg(long, requires = "hier")]
+        flat: bool,
     },
     /// Copy a file, keeping only the value change blocks that overlap a time
     /// range.
@@ -38,6 +53,15 @@ enum Command {
 fn main() -> std::io::Result<()> {
     match Cli::parse().command {
         Command::Dump { input } => dump(&input),
+        Command::Info { hier: false, .. } => {
+            // Like readelf and objdump, ask for something to be printed.
+            Cli::command()
+                .find_subcommand_mut("info")
+                .unwrap()
+                .print_help()?;
+            std::process::exit(2);
+        }
+        Command::Info { input, flat, .. } => info_hierarchy(&input, flat),
         Command::Splice {
             input,
             start_time,
@@ -45,6 +69,69 @@ fn main() -> std::io::Result<()> {
             output,
         } => splice(&input, start_time, end_time, &output),
     }
+}
+
+/// Prints the hierarchy of the file, as an indented tree or one variable per
+/// line.
+///
+/// Entries are printed as they are decoded.
+fn info_hierarchy(input: &Path, flat: bool) -> std::io::Result<()> {
+    let mut iterator = SectionIterator::new(BufReader::new(std::fs::File::open(input)?));
+    while let Some(section) = iterator.next()? {
+        if !matches!(
+            section.block_type(),
+            Some(BlockType::Hierarchy | BlockType::HierarchyLZ4 | BlockType::HierarchyLZ4Duo)
+        ) {
+            continue;
+        }
+
+        let mut out = BufWriter::new(std::io::stdout().lock());
+        // Names of the open scopes.
+        let mut scopes: Vec<String> = Vec::new();
+        for entry in section.read_hierarchy()?.entries()? {
+            match entry? {
+                HierarchyEntry::Scope {
+                    scope_type, name, ..
+                } => {
+                    let name = String::from_utf8_lossy(&name).into_owned();
+                    if !flat {
+                        let indent = scopes.len() * 2;
+                        writeln!(out, "{:indent$}scope {name} type={scope_type}", "")?;
+                    }
+                    scopes.push(name);
+                }
+                HierarchyEntry::UpScope => {
+                    scopes.pop();
+                }
+                HierarchyEntry::Var {
+                    var_type,
+                    direction,
+                    name,
+                    length,
+                    id,
+                    is_alias,
+                } => {
+                    let name = String::from_utf8_lossy(&name);
+                    let alias = if is_alias { " alias" } else { "" };
+                    let details =
+                        format!("type={var_type} dir={direction} length={length} id={id}{alias}");
+                    if flat {
+                        let path: String = scopes.iter().map(|s| format!("{s}.")).collect();
+                        writeln!(out, "{path}{name} {details}")?;
+                    } else {
+                        let indent = scopes.len() * 2;
+                        writeln!(out, "{:indent$}var {name} {details}", "")?;
+                    }
+                }
+                HierarchyEntry::AttributeBegin { .. } | HierarchyEntry::AttributeEnd => {}
+            }
+        }
+        return out.flush();
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "file has no hierarchy block",
+    ))
 }
 
 fn is_value_change(block_type: Option<BlockType>) -> bool {
