@@ -149,89 +149,35 @@ fn scope_type_name(scope_type: u8) -> Option<&'static str> {
     NAMES.get(usize::from(scope_type)).copied()
 }
 
-/// Prints the hierarchy of the file, as an indented tree or one variable per
-/// line.
-///
-/// Entries are printed as they are decoded. With `names`, only the names are
-/// printed.
-fn info_hierarchy(input: &Path, flat: bool, names: bool) -> std::io::Result<()> {
+fn scope_type_label(scope_type: u8) -> String {
+    scope_type_name(scope_type).map_or_else(|| format!("scope={scope_type}"), str::to_string)
+}
+
+fn var_type_label(var_type: u8) -> String {
+    var_type_name(var_type).map_or_else(|| format!("type={var_type}"), str::to_string)
+}
+
+fn direction_label(direction: u8) -> String {
+    var_direction_name(direction).map_or_else(|| format!("dir={direction}"), str::to_string)
+}
+
+/// Calls `f` for each entry of the hierarchy of the file, as they are decoded.
+fn for_each_hierarchy_entry(
+    input: &Path,
+    mut f: impl FnMut(HierarchyEntry) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let mut iterator = SectionIterator::new(BufReader::new(std::fs::File::open(input)?));
-    // Width of the id column, from the number of variables in the header.
-    let mut id_width = 1;
     while let Some(section) = iterator.next()? {
-        match section.block_type() {
-            Some(BlockType::Header) => {
-                let header = section.read_header()?;
-                id_width = header.num_vars.saturating_sub(1).to_string().len();
-                continue;
-            }
-            Some(BlockType::Hierarchy | BlockType::HierarchyLZ4 | BlockType::HierarchyLZ4Duo) => {}
-            _ => continue,
+        if !matches!(
+            section.block_type(),
+            Some(BlockType::Hierarchy | BlockType::HierarchyLZ4 | BlockType::HierarchyLZ4Duo)
+        ) {
+            continue;
         }
-
-        let mut out = BufWriter::new(std::io::stdout().lock());
-        // Names of the open scopes.
-        let mut scopes: Vec<String> = Vec::new();
         for entry in section.read_hierarchy()?.entries()? {
-            match entry? {
-                HierarchyEntry::Scope {
-                    scope_type, name, ..
-                } => {
-                    let name = String::from_utf8_lossy(&name).into_owned();
-                    if !flat {
-                        let indent = scopes.len() * 2;
-                        if names {
-                            writeln!(out, "{:indent$}{name}", "")?;
-                        } else {
-                            // The id and direction columns of a variable are
-                            // left blank, and the scope type takes the place
-                            // of the variable type.
-                            let blank = id_width + 1 + 1 + 7;
-                            let scope_type = scope_type_name(scope_type)
-                                .map_or_else(|| format!("scope={scope_type}"), str::to_string);
-                            writeln!(out, "{:indent$}{:blank$} {scope_type:<8} {name}", "", "")?;
-                        }
-                    }
-                    scopes.push(name);
-                }
-                HierarchyEntry::UpScope => {
-                    scopes.pop();
-                }
-                HierarchyEntry::Var {
-                    var_type,
-                    direction,
-                    name,
-                    length,
-                    id,
-                    is_alias,
-                } => {
-                    let name = String::from_utf8_lossy(&name);
-                    // In the tree the whole line is indented, not only the name.
-                    let (indent, name) = if flat {
-                        let path: String = scopes.iter().map(|s| format!("{s}.")).collect();
-                        (0, format!("{path}{name}"))
-                    } else {
-                        (scopes.len() * 2, name.into_owned())
-                    };
-                    if names {
-                        writeln!(out, "{:indent$}{name}", "")?;
-                        continue;
-                    }
-
-                    let marker = if is_alias { '*' } else { ' ' };
-                    let direction = direction_column(direction);
-                    let var_type = var_type_name(var_type)
-                        .map_or_else(|| format!("type={var_type}"), str::to_string);
-                    writeln!(
-                        out,
-                        "{:indent$}{id:<id_width$}{marker} {direction:<7} {var_type:<8} {name} ({length})",
-                        ""
-                    )?;
-                }
-                HierarchyEntry::AttributeBegin { .. } | HierarchyEntry::AttributeEnd => {}
-            }
+            f(entry?)?;
         }
-        return out.flush();
+        return Ok(());
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
@@ -239,8 +185,133 @@ fn info_hierarchy(input: &Path, flat: bool, names: bool) -> std::io::Result<()> 
     ))
 }
 
-fn direction_column(direction: u8) -> String {
-    var_direction_name(direction).map_or_else(|| format!("dir={direction}"), str::to_string)
+/// Width of each column of the hierarchy listing. A column that is empty on
+/// every line has width 0, and is left out.
+#[derive(Default)]
+struct Widths {
+    /// Digits of the largest variable id.
+    id: usize,
+    /// Whether any variable is an alias, which adds a `*` marker to the id.
+    alias: bool,
+    direction: usize,
+    /// Shared by variable types and scope types.
+    type_: usize,
+}
+
+impl Widths {
+    fn id_column(&self) -> usize {
+        match self.id {
+            0 => 0,
+            id => id + usize::from(self.alias),
+        }
+    }
+}
+
+/// Appends `text`, padded to `width`, and a separator. Does nothing if the
+/// column has no width.
+fn push_column(line: &mut String, text: &str, width: usize) {
+    if width > 0 {
+        line.push_str(&format!("{text:<width$} "));
+    }
+}
+
+/// Prints the hierarchy of the file, as an indented tree or one variable per
+/// line.
+///
+/// The hierarchy is read twice: first to find the width of each column, then
+/// to print it. Entries are decoded as they are printed, never all kept.
+/// With `names`, only the names are printed.
+fn info_hierarchy(input: &Path, flat: bool, names: bool) -> std::io::Result<()> {
+    let mut widths = Widths::default();
+    if !names {
+        for_each_hierarchy_entry(input, |entry| {
+            match entry {
+                HierarchyEntry::Scope { scope_type, .. } if !flat => {
+                    widths.type_ = widths.type_.max(scope_type_label(scope_type).len());
+                }
+                HierarchyEntry::Var {
+                    var_type,
+                    direction,
+                    id,
+                    is_alias,
+                    ..
+                } => {
+                    widths.id = widths.id.max(id.to_string().len());
+                    widths.alias |= is_alias;
+                    widths.direction = widths.direction.max(direction_label(direction).len());
+                    widths.type_ = widths.type_.max(var_type_label(var_type).len());
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+    }
+
+    let mut out = BufWriter::new(std::io::stdout().lock());
+    // Names of the open scopes.
+    let mut scopes: Vec<String> = Vec::new();
+    for_each_hierarchy_entry(input, |entry| {
+        // In the tree the whole line is indented, not only the name.
+        let indent = if flat { 0 } else { scopes.len() * 2 };
+        let mut line = " ".repeat(indent);
+        match entry {
+            HierarchyEntry::Scope {
+                scope_type, name, ..
+            } => {
+                let name = String::from_utf8_lossy(&name).into_owned();
+                if !flat {
+                    if !names {
+                        // The columns of a variable are left blank, except
+                        // for the scope type that takes the place of the
+                        // variable type.
+                        push_column(&mut line, "", widths.id_column());
+                        push_column(&mut line, "", widths.direction);
+                        push_column(&mut line, &scope_type_label(scope_type), widths.type_);
+                    }
+                    line.push_str(&name);
+                    writeln!(out, "{line}")?;
+                }
+                scopes.push(name);
+            }
+            HierarchyEntry::UpScope => {
+                scopes.pop();
+            }
+            HierarchyEntry::Var {
+                var_type,
+                direction,
+                name,
+                length,
+                id,
+                is_alias,
+            } => {
+                let name = String::from_utf8_lossy(&name);
+                if !names {
+                    let marker = match is_alias {
+                        true => "*",
+                        false if widths.alias => " ",
+                        false => "",
+                    };
+                    push_column(&mut line, &format!("{id}{marker}"), widths.id_column());
+                    push_column(&mut line, &direction_label(direction), widths.direction);
+                    push_column(&mut line, &var_type_label(var_type), widths.type_);
+                }
+                if flat {
+                    for scope in &scopes {
+                        line.push_str(scope);
+                        line.push('.');
+                    }
+                }
+                line.push_str(&name);
+                if !names {
+                    line.push_str(&format!(" ({length})"));
+                }
+                writeln!(out, "{line}")?;
+            }
+            HierarchyEntry::AttributeBegin { .. } | HierarchyEntry::AttributeEnd => {}
+        }
+        Ok(())
+    })?;
+    out.flush()
 }
 
 fn is_value_change(block_type: Option<BlockType>) -> bool {
