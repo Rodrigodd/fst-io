@@ -302,7 +302,9 @@ fn info_hierarchy(input: &Path, flat: bool, names: bool) -> std::io::Result<()> 
                     }
                 }
                 line.push_str(&name);
-                if !names {
+                // The length is implied by a scalar, and by the range in an
+                // array name.
+                if !names && length > 1 && !name.contains('[') {
                     line.push_str(&format!(" ({length})"));
                 }
                 writeln!(out, "{line}")?;
