@@ -32,6 +32,10 @@ enum Command {
         /// instead of an indented tree.
         #[arg(long, requires = "hier")]
         flat: bool,
+        /// Print only the names: the scope and variable names in the tree, or
+        /// the full dotted paths of the variables with --flat.
+        #[arg(long, requires = "hier")]
+        names: bool,
     },
     /// Copy a file, keeping only the value change blocks that overlap a time
     /// range.
@@ -61,7 +65,9 @@ fn main() -> std::io::Result<()> {
                 .print_help()?;
             std::process::exit(2);
         }
-        Command::Info { input, flat, .. } => info_hierarchy(&input, flat),
+        Command::Info {
+            input, flat, names, ..
+        } => info_hierarchy(&input, flat, names),
         Command::Splice {
             input,
             start_time,
@@ -71,18 +77,96 @@ fn main() -> std::io::Result<()> {
     }
 }
 
+/// Name of a variable type (FST_VT_*), or `None` if unknown.
+fn var_type_name(var_type: u8) -> Option<&'static str> {
+    const NAMES: [&str; 30] = [
+        "event",
+        "integer",
+        "parameter",
+        "real",
+        "real_parameter",
+        "reg",
+        "supply0",
+        "supply1",
+        "time",
+        "tri",
+        "triand",
+        "trior",
+        "trireg",
+        "tri0",
+        "tri1",
+        "wand",
+        "wire",
+        "wor",
+        "port",
+        "sparray",
+        "realtime",
+        "string",
+        "bit",
+        "logic",
+        "int",
+        "shortint",
+        "longint",
+        "byte",
+        "enum",
+        "shortreal",
+    ];
+    NAMES.get(usize::from(var_type)).copied()
+}
+
+/// Name of a variable direction (FST_VD_*), or `None` if unknown.
+fn var_direction_name(direction: u8) -> Option<&'static str> {
+    const NAMES: [&str; 6] = ["", "input", "output", "inout", "buffer", "linkage"];
+    NAMES.get(usize::from(direction)).copied()
+}
+
+/// Name of a scope type (FST_ST_*), or `None` if unknown.
+fn scope_type_name(scope_type: u8) -> Option<&'static str> {
+    const NAMES: [&str; 22] = [
+        "module",
+        "task",
+        "function",
+        "begin",
+        "fork",
+        "generate",
+        "struct",
+        "union",
+        "class",
+        "interface",
+        "package",
+        "program",
+        "vhdl_architecture",
+        "vhdl_procedure",
+        "vhdl_function",
+        "vhdl_record",
+        "vhdl_process",
+        "vhdl_block",
+        "vhdl_for_generate",
+        "vhdl_if_generate",
+        "vhdl_generate",
+        "vhdl_package",
+    ];
+    NAMES.get(usize::from(scope_type)).copied()
+}
+
 /// Prints the hierarchy of the file, as an indented tree or one variable per
 /// line.
 ///
-/// Entries are printed as they are decoded.
-fn info_hierarchy(input: &Path, flat: bool) -> std::io::Result<()> {
+/// Entries are printed as they are decoded. With `names`, only the names are
+/// printed.
+fn info_hierarchy(input: &Path, flat: bool, names: bool) -> std::io::Result<()> {
     let mut iterator = SectionIterator::new(BufReader::new(std::fs::File::open(input)?));
+    // Width of the id column, from the number of variables in the header.
+    let mut id_width = 1;
     while let Some(section) = iterator.next()? {
-        if !matches!(
-            section.block_type(),
-            Some(BlockType::Hierarchy | BlockType::HierarchyLZ4 | BlockType::HierarchyLZ4Duo)
-        ) {
-            continue;
+        match section.block_type() {
+            Some(BlockType::Header) => {
+                let header = section.read_header()?;
+                id_width = header.num_vars.saturating_sub(1).to_string().len();
+                continue;
+            }
+            Some(BlockType::Hierarchy | BlockType::HierarchyLZ4 | BlockType::HierarchyLZ4Duo) => {}
+            _ => continue,
         }
 
         let mut out = BufWriter::new(std::io::stdout().lock());
@@ -96,7 +180,17 @@ fn info_hierarchy(input: &Path, flat: bool) -> std::io::Result<()> {
                     let name = String::from_utf8_lossy(&name).into_owned();
                     if !flat {
                         let indent = scopes.len() * 2;
-                        writeln!(out, "{:indent$}scope {name} type={scope_type}", "")?;
+                        if names {
+                            writeln!(out, "{:indent$}{name}", "")?;
+                        } else {
+                            // The id and direction columns of a variable are
+                            // left blank, and the scope type takes the place
+                            // of the variable type.
+                            let blank = id_width + 1 + 1 + 7;
+                            let scope_type = scope_type_name(scope_type)
+                                .map_or_else(|| format!("scope={scope_type}"), str::to_string);
+                            writeln!(out, "{:blank$} {scope_type:<8} {:indent$}{name}", "", "")?;
+                        }
                     }
                     scopes.push(name);
                 }
@@ -112,16 +206,25 @@ fn info_hierarchy(input: &Path, flat: bool) -> std::io::Result<()> {
                     is_alias,
                 } => {
                     let name = String::from_utf8_lossy(&name);
-                    let alias = if is_alias { " alias" } else { "" };
-                    let details =
-                        format!("type={var_type} dir={direction} length={length} id={id}{alias}");
-                    if flat {
+                    let name = if flat {
                         let path: String = scopes.iter().map(|s| format!("{s}.")).collect();
-                        writeln!(out, "{path}{name} {details}")?;
+                        format!("{path}{name}")
                     } else {
-                        let indent = scopes.len() * 2;
-                        writeln!(out, "{:indent$}var {name} {details}", "")?;
+                        format!("{:indent$}{name}", "", indent = scopes.len() * 2)
+                    };
+                    if names {
+                        writeln!(out, "{name}")?;
+                        continue;
                     }
+
+                    let marker = if is_alias { '*' } else { ' ' };
+                    let direction = direction_column(direction);
+                    let var_type = var_type_name(var_type)
+                        .map_or_else(|| format!("type={var_type}"), str::to_string);
+                    writeln!(
+                        out,
+                        "{id:<id_width$}{marker} {direction:<7} {var_type:<8} {name} ({length})"
+                    )?;
                 }
                 HierarchyEntry::AttributeBegin { .. } | HierarchyEntry::AttributeEnd => {}
             }
@@ -132,6 +235,10 @@ fn info_hierarchy(input: &Path, flat: bool) -> std::io::Result<()> {
         std::io::ErrorKind::InvalidData,
         "file has no hierarchy block",
     ))
+}
+
+fn direction_column(direction: u8) -> String {
+    var_direction_name(direction).map_or_else(|| format!("dir={direction}"), str::to_string)
 }
 
 fn is_value_change(block_type: Option<BlockType>) -> bool {
