@@ -670,3 +670,42 @@ fn value_change_block_corrupt_trailer() {
         .unwrap();
     assert!(block.read_tail_layout().is_err());
 }
+
+#[test]
+fn header_roundtrip() {
+    let mut bytes = [0u8; HeaderBlock::LEN];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = i as u8;
+    }
+    bytes[16..24].copy_from_slice(&std::f64::consts::E.to_le_bytes());
+    let file = section(BlockType::Header as u8, &bytes);
+
+    let mut iterator = SectionIterator::new(std::io::Cursor::new(file));
+    let header = iterator.next().unwrap().unwrap().read_header().unwrap();
+    assert_eq!(header.to_bytes(), bytes);
+}
+
+#[test]
+fn copy_sections() {
+    let mut file = geometry(&[0x01, 0x02], 2);
+    file.extend(value_change_block());
+    let mut iterator = SectionIterator::new(std::io::Cursor::new(file.clone()));
+
+    let mut copy = Vec::new();
+    iterator
+        .next()
+        .unwrap()
+        .unwrap()
+        .copy_to(&mut copy)
+        .unwrap();
+    let mut block = iterator
+        .next()
+        .unwrap()
+        .unwrap()
+        .read_value_changes()
+        .unwrap();
+    // The block is copied whole even after its fixed fields were read.
+    block.copy_to(&mut copy).unwrap();
+    assert!(iterator.next().unwrap().is_some()); // blackout, not copied
+    assert_eq!(copy, file[..copy.len()]);
+}

@@ -1,11 +1,143 @@
-use std::io::Seek;
+use std::io::{BufReader, BufWriter, Seek, Write};
+use std::path::{Path, PathBuf};
 
+use clap::{Parser, Subcommand};
 use fst_io::*;
 
-fn main() -> std::io::Result<()> {
-    let file = std::env::args().nth(1).expect("Please provide a file path");
+#[derive(Parser)]
+#[command(version, about = "Tools to inspect and edit FST waveform files")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
 
-    let file = std::fs::File::open(file).expect("Failed to open file");
+#[derive(Subcommand)]
+enum Command {
+    /// Print the structure of a file.
+    Dump {
+        /// The FST file to read.
+        input: PathBuf,
+    },
+    /// Copy a file, keeping only the value change blocks that overlap a time
+    /// range.
+    ///
+    /// The header (updated), geometry, hierarchy and any other section are
+    /// preserved.
+    Splice {
+        /// The FST file to read.
+        input: PathBuf,
+        /// Start of the time range, in units of the file timescale.
+        start_time: u64,
+        /// End of the time range (inclusive), in units of the file timescale.
+        end_time: u64,
+        /// The FST file to write.
+        output: PathBuf,
+    },
+}
+
+fn main() -> std::io::Result<()> {
+    match Cli::parse().command {
+        Command::Dump { input } => dump(&input),
+        Command::Splice {
+            input,
+            start_time,
+            end_time,
+            output,
+        } => splice(&input, start_time, end_time, &output),
+    }
+}
+
+fn is_value_change(block_type: Option<BlockType>) -> bool {
+    matches!(
+        block_type,
+        Some(
+            BlockType::ValueChangeData
+                | BlockType::ValueChangeDataDynamicAlias
+                | BlockType::ValueChangeDataDynamicAlias2
+        )
+    )
+}
+
+fn splice(input: &Path, start_time: u64, end_time: u64, output: &Path) -> std::io::Result<()> {
+    if start_time > end_time {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "start time is after end time",
+        ));
+    }
+
+    let open = || -> std::io::Result<_> { Ok(BufReader::new(std::fs::File::open(input)?)) };
+
+    // The header comes first but needs to know which blocks are kept, so the
+    // file is read twice. The first pass only reads the 24 fixed bytes of each
+    // value change block.
+    let mut header = None;
+    // Value change blocks are in time order, so the blocks that overlap the
+    // range are contiguous: only the first and the last one are needed.
+    // `first` and `last` are `(index, start_time, end_time)`.
+    let mut first = None;
+    let mut last = None;
+    let mut total = 0usize;
+    let mut iterator = SectionIterator::new(open()?);
+    while let Some(section) = iterator.next()? {
+        match section.block_type() {
+            Some(BlockType::Header) => header = Some(section.read_header()?),
+            block_type if is_value_change(block_type) => {
+                let block = section.read_value_changes()?;
+                if block.end_time >= start_time && block.start_time <= end_time {
+                    let entry = (total, block.start_time, block.end_time);
+                    first.get_or_insert(entry);
+                    last = Some(entry);
+                }
+                total += 1;
+            }
+            _ => {}
+        }
+    }
+    let mut header = header.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "file has no header block")
+    })?;
+    let kept_range = match (first, last) {
+        (Some((first, start, _)), Some((last, _, end))) => {
+            header.start_time = start;
+            header.end_time = end;
+            first..last + 1
+        }
+        _ => {
+            header.start_time = start_time;
+            header.end_time = start_time;
+            0..0
+        }
+    };
+    let kept = kept_range.len();
+    header.num_vc_blocks = kept as u64;
+
+    let mut out = BufWriter::new(std::fs::File::create(output)?);
+    let mut index = 0usize;
+    let mut iterator = SectionIterator::new(open()?);
+    while let Some(mut section) = iterator.next()? {
+        match section.block_type() {
+            Some(BlockType::Header) => {
+                write_section_header(&mut out, section.block_type, section.len)?;
+                out.write_all(&header.to_bytes())?;
+            }
+            block_type if is_value_change(block_type) => {
+                if kept_range.contains(&index) {
+                    section.copy_to(&mut out)?;
+                }
+                index += 1;
+            }
+            _ => section.copy_to(&mut out)?,
+        }
+    }
+    out.flush()?;
+
+    println!("Kept {kept} of {total} value change blocks");
+    Ok(())
+}
+
+fn dump(path: &Path) -> std::io::Result<()> {
+    let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::new(file);
 
     // The geometry block comes after the value change blocks, but is needed to

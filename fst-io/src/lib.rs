@@ -1,4 +1,4 @@
-use std::io::{BufRead, Read, Seek, Take};
+use std::io::{BufRead, Read, Seek, Take, Write};
 
 use flate2::read::{GzDecoder, ZlibDecoder};
 
@@ -121,6 +121,34 @@ pub struct HeaderBlock {
     pub timezero: i64,
 }
 
+impl HeaderBlock {
+    /// Length of the header block data.
+    pub const LEN: usize = 321;
+
+    /// Encodes the header block data, the inverse of [`Section::read_header`].
+    pub fn to_bytes(&self) -> [u8; Self::LEN] {
+        let mut data = [0u8; Self::LEN];
+        data[0..8].copy_from_slice(&self.start_time.to_be_bytes());
+        data[8..16].copy_from_slice(&self.end_time.to_be_bytes());
+        data[16..24].copy_from_slice(&match self.real_endianness {
+            RealEndianess::LittleEndian => std::f64::consts::E.to_le_bytes(),
+            RealEndianess::BigEndian => std::f64::consts::E.to_be_bytes(),
+        });
+        data[24..32].copy_from_slice(&self.writer_memory_use.to_be_bytes());
+        data[32..40].copy_from_slice(&self.num_scopes.to_be_bytes());
+        data[40..48].copy_from_slice(&self.num_hierarchy_vars.to_be_bytes());
+        data[48..56].copy_from_slice(&self.num_vars.to_be_bytes());
+        data[56..64].copy_from_slice(&self.num_vc_blocks.to_be_bytes());
+        data[64] = self.timescale as u8;
+        data[65..193].copy_from_slice(&self.writer);
+        data[193..219].copy_from_slice(&self.date);
+        data[219..312].copy_from_slice(&self.reserved);
+        data[312] = self.file_type;
+        data[313..321].copy_from_slice(&self.timezero.to_be_bytes());
+        data
+    }
+}
+
 impl<R: Read> Read for Section<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.data.read(buf)
@@ -149,6 +177,33 @@ impl<R> Section<'_, R> {
             _ => None,
         }
     }
+}
+
+impl<R: Read> Section<'_, R> {
+    /// Writes the whole section, including the block type and length, to `out`.
+    ///
+    /// The section data must not have been read yet.
+    pub fn copy_to<W: Write>(&mut self, out: &mut W) -> std::io::Result<()> {
+        write_section_header(out, self.block_type, self.len)?;
+        let copied = std::io::copy(&mut self.data, out)?;
+        if copied != self.len {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        Ok(())
+    }
+}
+
+/// Writes the block type and length fields that start a section.
+///
+/// `len` is the length of the section data.
+pub fn write_section_header<W: Write>(
+    out: &mut W,
+    block_type: u8,
+    len: u64,
+) -> std::io::Result<()> {
+    out.write_all(&[block_type])?;
+    // The section length includes the length field itself.
+    out.write_all(&(len + 8).to_be_bytes())
 }
 
 impl<R: Read + Seek> Section<'_, R> {
@@ -812,6 +867,18 @@ impl<'a, R: Read + Seek> ValueChangeBlock<'a, R> {
         let mut data = vec![0; to_usize(length)?];
         self.data.read_exact(&mut data)?;
         Ok(data)
+    }
+
+    /// Writes the whole section, including the block type and length, to
+    /// `out`.
+    pub fn copy_to<W: Write>(&mut self, out: &mut W) -> std::io::Result<()> {
+        self.seek_to(0)?;
+        write_section_header(out, self.block_type as u8, self.len)?;
+        let copied = std::io::copy(&mut self.data, out)?;
+        if copied != self.len {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        Ok(())
     }
 
     /// Locates the tables at the start of the section: the bits array and the
