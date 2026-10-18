@@ -1137,13 +1137,13 @@ fn decode_positions_alias2(
             offset = checked_add(offset, value as u64)?;
             entries.push(PositionEntry::Offset(offset));
         } else {
-            let alias = if value < 0 {
-                previous_alias = Some(value);
-                value
-            } else {
+            let alias = if value == 0 {
                 // 0 repeats the previous alias.
                 previous_alias
                     .ok_or_else(|| invalid_data("repeated alias without a previous one"))?
+            } else {
+                previous_alias = Some(value);
+                value
             };
             // The alias is -(id + 1).
             entries.push(PositionEntry::Alias((-(alias + 1)) as u64));
