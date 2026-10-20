@@ -55,6 +55,9 @@ enum Command {
         /// Last time to dump (inclusive). Defaults to the end of the file.
         #[arg(long)]
         end_time: Option<u64>,
+        /// Number of worker threads used to decode value-change blocks.
+        #[arg(long, short, default_value_t = 3)]
+        jobs: usize,
     },
     /// Copy a file, keeping only the value change blocks that overlap a time
     /// range.
@@ -92,7 +95,8 @@ fn main() -> std::io::Result<()> {
             output,
             start_time,
             end_time,
-        } => vcd(&input, output.as_deref(), start_time, end_time),
+            jobs,
+        } => vcd(&input, output.as_deref(), start_time, end_time, jobs),
         Command::Splice {
             input,
             start_time,
@@ -574,6 +578,7 @@ fn vcd(
     output: Option<&Path>,
     start_time: Option<u64>,
     end_time: Option<u64>,
+    jobs: usize,
 ) -> std::io::Result<()> {
     if let (Some(start), Some(end)) = (start_time, end_time)
         && start > end
@@ -624,7 +629,7 @@ fn vcd(
     let vars = write_vcd_declarations(&mut out, input, &lengths)?;
     writeln!(out, "$enddefinitions $end")?;
 
-    write_vcd_value_changes(&mut out, input, &lengths, &vars, &header, start, end)?;
+    write_vcd_value_changes(&mut out, input, &lengths, &vars, &header, start, end, jobs)?;
 
     out.flush()
 }
@@ -731,17 +736,24 @@ fn write_vcd_declarations<W: Write>(
 ///
 /// FST value-change blocks are time-ordered and disjoint: every time in block
 /// N precedes every time in block N+1. So the whole dump is already in time
-/// order block-by-block, and only one block's changes are ever held in memory
-/// at a time -- this streams arbitrarily large files. Within a single block,
-/// changes are gathered per variable (each variable's waves are time-ordered)
-/// and stably sorted by time before being emitted.
+/// order block-by-block, and the decoding of one in-range block does not
+/// depend on any other. That independence is what lets the decode run in
+/// parallel: the main thread streams buffered blocks to a pool of worker
+/// threads, each turns a block into a time-sorted change list, and a single
+/// writer thread reassembles the lists in block order and emits the VCD text.
 ///
-/// The output mirrors the reference C library: when the dump begins exactly at
-/// the first block's first time step (the whole file, from the start), the
-/// first time step's changes are wrapped in `$dumpvars` and no separate
-/// initial frame is written. When the dump starts mid-stream -- a later
-/// `--start-time`, or any block skipped before the range -- the state carried
-/// into the range is written first as a `$dumpvars` frame.
+/// Only the decode is parallel; the output is still one serial, time-ordered
+/// stream. The number of blocks in flight (dispatched to the pool but not yet
+/// written) is bounded, which bounds memory regardless of file size -- the
+/// same streaming guarantee the serial version had.
+///
+/// The prelude -- folding every block before the range, and the first in-range
+/// block's initial state, into the `$dumpvars` baseline -- stays on the main
+/// thread: it is inherently serial (a running fold toward `start`) and is
+/// written before any worker output. The `$dumpvars`/`#time` state machine
+/// likewise lives only on the writer thread, so the emitted framing mirrors the
+/// reference C library exactly, as in the serial path.
+#[allow(clippy::too_many_arguments)]
 fn write_vcd_value_changes<W: Write>(
     out: &mut W,
     input: &Path,
@@ -750,6 +762,7 @@ fn write_vcd_value_changes<W: Write>(
     header: &HeaderBlock,
     start: u64,
     end: u64,
+    threads: usize,
 ) -> std::io::Result<()> {
     let real_endianness = header.real_endianness;
 
@@ -771,27 +784,23 @@ fn write_vcd_value_changes<W: Write>(
     let mut baseline_real: std::collections::HashMap<u64, [u8; 8]> =
         std::collections::HashMap::new();
 
-    // Reused per-block scratch for one block's in-range changes. Holding a
-    // single block -- never the whole file -- is what keeps memory bounded.
-    let mut changes: Vec<(u64, u64, RenderedValue)> = Vec::new();
-
     // Set true if any block entirely before the range was skipped.
     let mut blocks_skipped = false;
-    // Has the first in-range block been reached and its framing decided?
-    let mut emitting = false;
-    // dumpvars state machine, only used on the no-frame path: 0 = not started,
-    // 1 = inside dumpvars, 2 = closed. Persists across blocks.
-    let mut dumpvars_state = 0u8;
-    // Last `#time` written, to avoid repeating it across block boundaries.
-    let mut current_time: Option<u64> = None;
 
     let mut iterator = SectionIterator::new(std::fs::File::open(input)?);
+
+    // --- Serial prelude: fold pre-range blocks and locate the first in-range
+    // block, so the baseline carried into the range is complete before any
+    // parallel work starts. ---
+    let mut first_in_range: Option<Section<std::io::Cursor<Vec<u8>>>> = None;
     while let Some(section) = iterator.next()? {
         if !is_value_change(section.block_type()) {
             continue;
         }
+        // Buffer the block so it is detached from the file iterator and can be
+        // decoded here (prelude) or moved to a worker thread (in-range).
+        let section = section.buffer()?;
         let mut block = section.read_value_changes()?;
-        let block_start = block.start_time;
 
         if block.end_time < start {
             // Before the range: fold its final state into the baseline. The
@@ -817,87 +826,382 @@ fn write_vcd_value_changes<W: Write>(
             blocks_skipped = true;
             continue;
         }
-        if block_start > end {
+        if block.start_time > end {
+            // Entirely past the range: nothing in range follows.
             break;
         }
 
+        // First in-range block: fold its initial bits array and its pre-`start`
+        // changes into the baseline, completing the state carried into `start`.
         let head = block.read_head_layout()?;
-        let tail = block.read_tail_layout()?;
-        let positions = block.read_positions(&head, &tail)?;
-        let times = block.read_time_table(&tail)?;
-        let first_time = times.first().copied().unwrap_or(block_start);
-
-        // Fold the first in-range block's initial bits array into the baseline;
-        // its pre-`start` changes (below) finish carrying the state to `start`.
-        let is_first_block = !emitting;
-        if is_first_block {
-            let bits = block.read_bits(&head)?;
-            for (index, value) in bits.values(lengths).enumerate() {
-                let value = value?;
-                if let Some(&id) = ids.get(index) {
-                    update_baseline(&mut baseline, &mut baseline_real, id, &value);
+        let bits = block.read_bits(&head)?;
+        for (index, value) in bits.values(lengths).enumerate() {
+            let value = value?;
+            if let Some(&id) = ids.get(index) {
+                update_baseline(&mut baseline, &mut baseline_real, id, &value);
+            }
+        }
+        if start > block.start_time {
+            // Changes before `start` advance the baseline rather than emit.
+            let tail = block.read_tail_layout()?;
+            let positions = block.read_positions(&head, &tail)?;
+            let times = block.read_time_table(&tail)?;
+            for (geometry_index, &id) in ids.iter().enumerate() {
+                let waves = block.read_waves(&head, &positions, id, lengths[geometry_index])?;
+                for change in waves.iter() {
+                    let (time_index, value) = change?;
+                    let time = times
+                        .get(time_index as usize)
+                        .copied()
+                        .ok_or_else(|| invalid_data("time index out of range"))?;
+                    if time < start {
+                        update_baseline(&mut baseline, &mut baseline_real, id, &value);
+                    }
                 }
             }
         }
 
-        // Collect this block's in-range changes (one block in memory at a
-        // time); pre-range changes advance the baseline instead.
-        changes.clear();
-        for (geometry_index, &id) in ids.iter().enumerate() {
-            let waves = block.read_waves(&head, &positions, id, lengths[geometry_index])?;
-            for change in waves.iter() {
-                let (time_index, value) = change?;
-                let time = times
-                    .get(time_index as usize)
-                    .copied()
-                    .ok_or_else(|| invalid_data("time index out of range"))?;
-                if time < start {
-                    update_baseline(&mut baseline, &mut baseline_real, id, &value);
-                    continue;
-                }
-                if time > end {
-                    continue;
-                }
-                changes.push((time, id, RenderedValue::from_value(&value)));
-            }
-        }
-        // Stable sort by time keeps per-variable order within a time step.
-        changes.sort_by_key(|&(time, _, _)| time);
+        // Re-buffer the block to hand to a worker: the prelude read moved its
+        // cursor, and the worker decodes it from scratch. Rebuilding from the
+        // owned buffer avoids re-reading the file.
+        first_in_range = Some(rebuffer(block));
+        break;
+    }
 
-        if is_first_block {
+    // --- Emit the initial frame (if needed) before any value changes. ---
+    let frame = match &first_in_range {
+        Some(section) => {
+            let block_start = value_change_start_time(section)?;
+            let first_time = value_change_first_time(section)?.unwrap_or(block_start);
             // A separate initial frame is written when the dump does not begin
             // exactly at the first block's first time step: a later start time,
             // a skipped block, or a block whose first time is after its start.
-            let needs_frame = blocks_skipped || start > first_time || block_start != first_time;
-            if needs_frame {
-                let frame_time = block_start.max(start);
-                writeln!(out, "#{frame_time}")?;
-                writeln!(out, "$dumpvars")?;
-                write_baseline(out, &ids, vars, &baseline, &baseline_real, real_endianness)?;
-                writeln!(out, "$end")?;
-                current_time = Some(frame_time);
-                // The frame already played the dumpvars role; treat it closed.
-                dumpvars_state = 2;
-            }
-            emitting = true;
+            blocks_skipped || start > first_time || block_start != first_time
         }
-
-        emit_block_changes(
-            out,
-            &changes,
-            vars,
-            real_endianness,
-            &mut dumpvars_state,
-            &mut current_time,
-        )?;
-    }
-
-    // Close a dumpvars section left open by a single-time-step dump.
-    if dumpvars_state == 1 {
+        None => false,
+    };
+    if frame {
+        let frame_time = first_in_range
+            .as_ref()
+            .map(value_change_start_time)
+            .transpose()?
+            .map(|s| s.max(start))
+            .unwrap_or(start);
+        writeln!(out, "#{frame_time}")?;
+        writeln!(out, "$dumpvars")?;
+        write_baseline(out, &ids, vars, &baseline, &baseline_real, real_endianness)?;
         writeln!(out, "$end")?;
     }
+    // The dumpvars state machine starts closed when a frame was emitted (it
+    // already played the dumpvars role), otherwise not started.
+    let initial_dumpvars_state = if frame { 2u8 } else { 0u8 };
+    let initial_time = if frame {
+        first_in_range
+            .as_ref()
+            .map(value_change_start_time)
+            .transpose()?
+            .map(|s| s.max(start))
+    } else {
+        None
+    };
 
-    Ok(())
+    // If there is no in-range block, there is nothing to parallelize: a frame
+    // may still have been emitted above, with no changes to follow.
+    let Some(first_block) = first_in_range else {
+        return Ok(());
+    };
+
+    // --- Parallel decode: workers decode blocks, the writer emits them in
+    // order. ---
+    let threads = threads.max(1);
+    let in_flight_cap = threads + 1;
+
+    // Bounds blocks dispatched-but-not-yet-written to `in_flight_cap`: the main
+    // thread acquires a permit before dispatching a block, the writer releases
+    // one after writing it.
+    let in_flight = Semaphore::new(in_flight_cap);
+
+    // Work queue (main -> workers) and result queue (workers -> writer).
+    let (work_tx, work_rx) = std::sync::mpsc::channel::<Job>();
+    let work_rx = std::sync::Mutex::new(work_rx);
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<std::io::Result<Decoded>>();
+
+    // The writer runs on THIS (main) thread because `out` is not `Send`. Workers
+    // and the dispatcher are scoped threads; they borrow the shared read-only
+    // metadata (`ids`, `lengths`, `vars` via the writer) and the semaphore.
+    std::thread::scope(|scope| -> std::io::Result<()> {
+        // Worker threads: pull a job, decode its block, send the result.
+        for _ in 0..threads {
+            let work_rx = &work_rx;
+            let result_tx = result_tx.clone();
+            let ids = &ids;
+            scope.spawn(move || {
+                loop {
+                    let job = {
+                        let guard = work_rx.lock().unwrap();
+                        guard.recv()
+                    };
+                    let Ok(job) = job else { break };
+                    let decoded =
+                        decode_block_changes(job.seq, job.section, ids, lengths, start, end);
+                    // A send failure means the writer is gone (an earlier error
+                    // tore down the scope); stop quietly.
+                    if result_tx.send(decoded).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        // Dispatcher thread: feed in-range blocks to the workers in sequence
+        // order, blocking on the semaphore so the number of blocks in flight
+        // stays bounded. A fatal read error is sent to the writer so the main
+        // thread observes it; a shutdown (writer stopped early) aborts dispatch.
+        let dispatch_tx = result_tx.clone();
+        let in_flight = &in_flight;
+        scope.spawn(move || {
+            let mut seq = 0u64;
+            // Returns false if the semaphore was shut down, meaning stop.
+            let mut dispatch = |section: Section<std::io::Cursor<Vec<u8>>>| -> bool {
+                if !in_flight.acquire() {
+                    return false;
+                }
+                let _ = work_tx.send(Job { seq, section });
+                seq += 1;
+                true
+            };
+
+            let run = || -> std::io::Result<()> {
+                if !dispatch(first_block) {
+                    return Ok(());
+                }
+                while let Some(section) = iterator.next()? {
+                    if !is_value_change(section.block_type()) {
+                        continue;
+                    }
+                    let section = section.buffer()?;
+                    // Stop once a block starts past the range.
+                    if value_change_start_time(&section)? > end {
+                        break;
+                    }
+                    if !dispatch(section) {
+                        break;
+                    }
+                }
+                Ok(())
+            };
+            if let Err(err) = run() {
+                let _ = dispatch_tx.send(Err(err));
+            }
+            // Closing the work channel lets workers finish once drained.
+            drop(work_tx);
+        });
+
+        // Drop the main thread's spare senders so the result channel closes
+        // once every worker and the dispatcher have finished.
+        drop(result_tx);
+
+        // Writer loop (main thread): reassemble decoded blocks in sequence
+        // order and emit them as one serial VCD stream. The result is captured
+        // rather than propagated with `?`, so that on ANY exit the semaphore is
+        // shut down and the result receiver dropped -- otherwise the dispatcher
+        // could block forever in `acquire` and workers in `recv`, hanging the
+        // scope that joins them.
+        let mut next_seq = 0u64;
+        let mut pending: std::collections::BTreeMap<u64, Vec<(u64, u64, RenderedValue)>> =
+            std::collections::BTreeMap::new();
+        let mut dumpvars_state = initial_dumpvars_state;
+        let mut current_time = initial_time;
+
+        let mut write_loop = || -> std::io::Result<()> {
+            while let Ok(result) = result_rx.recv() {
+                let decoded = result?;
+                pending.insert(decoded.seq, decoded.changes);
+                // Emit every block that is now contiguous from next_seq.
+                while let Some(changes) = pending.remove(&next_seq) {
+                    emit_block_changes(
+                        out,
+                        &changes,
+                        vars,
+                        real_endianness,
+                        &mut dumpvars_state,
+                        &mut current_time,
+                    )?;
+                    next_seq += 1;
+                    // One block written: free a permit so the dispatcher may
+                    // send another, keeping in-flight <= 2 * threads.
+                    in_flight.release();
+                }
+            }
+            // Close a dumpvars section left open by a single-time-step dump.
+            if dumpvars_state == 1 {
+                writeln!(out, "$end")?;
+            }
+            Ok(())
+        };
+        let result = write_loop();
+
+        // Unblock the dispatcher and workers so the scope can join cleanly,
+        // whether the writer finished normally or bailed on an error.
+        in_flight.shutdown();
+        drop(result_rx);
+
+        result
+    })
+}
+
+/// A block handed to a worker for decoding, tagged with its position in the
+/// dump so the writer can reassemble the results in order.
+struct Job {
+    seq: u64,
+    section: Section<std::io::Cursor<Vec<u8>>>,
+}
+
+/// A worker's decoded output: the block's in-range changes, time-sorted.
+struct Decoded {
+    seq: u64,
+    changes: Vec<(u64, u64, RenderedValue)>,
+}
+
+/// Decodes one in-range block into its time-sorted change list. This is the
+/// parallel hot path: it runs on a worker thread and touches only its own
+/// buffered block plus the shared read-only metadata.
+fn decode_block_changes(
+    seq: u64,
+    section: Section<std::io::Cursor<Vec<u8>>>,
+    ids: &[u64],
+    lengths: &[VariableLength],
+    start: u64,
+    end: u64,
+) -> std::io::Result<Decoded> {
+    let mut block = section.read_value_changes()?;
+    let head = block.read_head_layout()?;
+    let tail = block.read_tail_layout()?;
+    let positions = block.read_positions(&head, &tail)?;
+    let times = block.read_time_table(&tail)?;
+
+    let mut changes: Vec<(u64, u64, RenderedValue)> = Vec::new();
+    for (geometry_index, &id) in ids.iter().enumerate() {
+        let waves = block.read_waves(&head, &positions, id, lengths[geometry_index])?;
+        for change in waves.iter() {
+            let (time_index, value) = change?;
+            let time = times
+                .get(time_index as usize)
+                .copied()
+                .ok_or_else(|| invalid_data("time index out of range"))?;
+            // Pre-`start` changes were already folded into the baseline by the
+            // serial prelude; here they are simply skipped.
+            if time < start || time > end {
+                continue;
+            }
+            changes.push((time, id, RenderedValue::from_value(&value)));
+        }
+    }
+    // Stable sort by time keeps per-variable order within a time step.
+    changes.sort_by_key(|&(time, _, _)| time);
+    Ok(Decoded { seq, changes })
+}
+
+/// Reads a buffered value change block's start time without consuming it.
+fn value_change_start_time(section: &Section<std::io::Cursor<Vec<u8>>>) -> std::io::Result<u64> {
+    let data = section.data.get_ref();
+    // The 24 fixed-size fields follow the already-read section header; the
+    // start time is the first 8 bytes of the section data.
+    let bytes = data
+        .get(0..8)
+        .ok_or_else(|| invalid_data("value change block too short"))?;
+    Ok(u64::from_be_bytes(bytes.try_into().unwrap()))
+}
+
+/// Reads a buffered block's first time-table entry, used to decide framing.
+/// Returns `None` if the block has no time steps.
+fn value_change_first_time(
+    section: &Section<std::io::Cursor<Vec<u8>>>,
+) -> std::io::Result<Option<u64>> {
+    // Decoding the time table needs the tail layout; clone the buffer so the
+    // caller's section is left untouched for dispatch.
+    let clone = Section {
+        block_type: section.block_type,
+        len: section.len,
+        data: std::io::Cursor::new(section.data.get_ref().clone()),
+    };
+    let mut block = clone.read_value_changes()?;
+    let tail = block.read_tail_layout()?;
+    let times = block.read_time_table(&tail)?;
+    Ok(times.first().copied())
+}
+
+/// Rebuilds a buffered section from a value change block whose cursor the
+/// prelude advanced, so a worker can decode it from the start without
+/// re-reading the file. The block's buffer is the full section data minus the
+/// 24-byte fixed header consumed by `read_value_changes`, so the section is
+/// reconstructed from the original owned bytes.
+fn rebuffer(
+    block: ValueChangeBlock<std::io::Cursor<Vec<u8>>>,
+) -> Section<std::io::Cursor<Vec<u8>>> {
+    let data = block.data.into_inner();
+    Section {
+        block_type: block.block_type as u8,
+        len: block.len,
+        data: std::io::Cursor::new(data),
+    }
+}
+
+/// A counting semaphore built on the standard library only (fst-tool takes no
+/// threading dependency). `acquire` blocks until a permit is free or the
+/// semaphore is shut down; `release` returns a permit and wakes a waiter.
+///
+/// `shutdown` exists for the error path: if the writer stops early, the
+/// dispatcher could otherwise block forever in `acquire` (no permits are ever
+/// released again), which would hang the scope that joins every thread.
+/// Shutting down makes every current and future `acquire` return immediately.
+struct Semaphore {
+    state: std::sync::Mutex<SemaphoreState>,
+    available: std::sync::Condvar,
+}
+
+struct SemaphoreState {
+    permits: usize,
+    shutdown: bool,
+}
+
+impl Semaphore {
+    fn new(permits: usize) -> Self {
+        Semaphore {
+            state: std::sync::Mutex::new(SemaphoreState {
+                permits,
+                shutdown: false,
+            }),
+            available: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Blocks for a permit. Returns `true` on success, `false` if the semaphore
+    /// was shut down (in which case no permit was taken).
+    fn acquire(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        while state.permits == 0 && !state.shutdown {
+            state = self.available.wait(state).unwrap();
+        }
+        if state.shutdown {
+            return false;
+        }
+        state.permits -= 1;
+        true
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.permits += 1;
+        self.available.notify_one();
+    }
+
+    /// Wakes every waiter and makes all future `acquire` calls return `false`.
+    fn shutdown(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.shutdown = true;
+        self.available.notify_all();
+    }
 }
 
 /// Emits one block's already-sorted changes, carrying the `$dumpvars` state
