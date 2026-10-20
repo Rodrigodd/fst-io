@@ -658,8 +658,11 @@ fn write_vcd_declarations<W: Write>(
     out: &mut W,
     input: &Path,
     lengths: &[VariableLength],
-) -> std::io::Result<std::collections::HashMap<u64, VcdVar>> {
-    let mut vars: std::collections::HashMap<u64, VcdVar> = std::collections::HashMap::new();
+) -> std::io::Result<Vec<Option<VcdVar>>> {
+    // Indexed directly by (0-based) non-aliased variable id. Ids are dense, so
+    // a Vec avoids a per-value-change hash lookup in the hot emit loop; any
+    // gap stays `None`.
+    let mut vars: Vec<Option<VcdVar>> = Vec::new();
     // The geometry lengths are indexed by non-aliased variable id - 1.
     let mut next_length = 0usize;
     let mut unnamed_scope = 0u32;
@@ -717,7 +720,11 @@ fn write_vcd_declarations<W: Write>(
                         .copied()
                         .ok_or_else(|| invalid_data("more variables than geometry lengths"))?;
                     next_length += 1;
-                    vars.entry(id).or_insert(VcdVar {
+                    let idx = id as usize;
+                    if idx >= vars.len() {
+                        vars.resize_with(idx + 1, || None);
+                    }
+                    vars[idx].get_or_insert(VcdVar {
                         code,
                         length: geometry_length,
                         is_port: var_type == VAR_TYPE_PORT,
@@ -758,7 +765,7 @@ fn write_vcd_value_changes<W: Write>(
     out: &mut W,
     input: &Path,
     lengths: &[VariableLength],
-    vars: &std::collections::HashMap<u64, VcdVar>,
+    vars: &[Option<VcdVar>],
     header: &HeaderBlock,
     start: u64,
     end: u64,
@@ -1227,7 +1234,7 @@ fn write_u64<W: Write>(out: &mut W, mut value: u64) -> std::io::Result<()> {
 fn emit_block_changes<W: Write>(
     out: &mut W,
     changes: &[(u64, u64, RenderedValue)],
-    vars: &std::collections::HashMap<u64, VcdVar>,
+    vars: &[Option<VcdVar>],
     real_endianness: RealEndianess,
     dumpvars_state: &mut u8,
     current_time: &mut Option<u64>,
@@ -1250,7 +1257,7 @@ fn emit_block_changes<W: Write>(
             }
             *current_time = Some(*time);
         }
-        if let Some(var) = vars.get(id) {
+        if let Some(Some(var)) = vars.get(*id as usize) {
             value.write(out, var, real_endianness)?;
         }
     }
@@ -1337,13 +1344,15 @@ fn update_baseline(
 fn write_baseline<W: Write>(
     out: &mut W,
     ids: &[u64],
-    vars: &std::collections::HashMap<u64, VcdVar>,
+    vars: &[Option<VcdVar>],
     baseline: &std::collections::HashMap<u64, Vec<u8>>,
     baseline_real: &std::collections::HashMap<u64, [u8; 8]>,
     real_endianness: RealEndianess,
 ) -> std::io::Result<()> {
     for &id in ids {
-        let Some(var) = vars.get(&id) else { continue };
+        let Some(Some(var)) = vars.get(id as usize) else {
+            continue;
+        };
         if let Some(bytes) = baseline_real.get(&id) {
             writeln!(
                 out,
