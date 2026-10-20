@@ -938,26 +938,28 @@ fn write_vcd_value_changes<W: Write>(
     // metadata (`ids`, `lengths`, `vars` via the writer) and the semaphore.
     std::thread::scope(|scope| -> std::io::Result<()> {
         // Worker threads: pull a job, decode its block, send the result.
-        for _ in 0..threads {
+        for i in 0..threads {
             let work_rx = &work_rx;
             let result_tx = result_tx.clone();
             let ids = &ids;
-            scope.spawn(move || {
-                loop {
-                    let job = {
-                        let guard = work_rx.lock().unwrap();
-                        guard.recv()
-                    };
-                    let Ok(job) = job else { break };
-                    let decoded =
-                        decode_block_changes(job.seq, job.section, ids, lengths, start, end);
-                    // A send failure means the writer is gone (an earlier error
-                    // tore down the scope); stop quietly.
-                    if result_tx.send(decoded).is_err() {
-                        break;
+            std::thread::Builder::new()
+                .name(format!("vcd-decode-{i}"))
+                .spawn_scoped(scope, move || {
+                    loop {
+                        let job = {
+                            let guard = work_rx.lock().unwrap();
+                            guard.recv()
+                        };
+                        let Ok(job) = job else { break };
+                        let decoded =
+                            decode_block_changes(job.seq, job.section, ids, lengths, start, end);
+                        // A send failure means the writer is gone (an earlier error
+                        // tore down the scope); stop quietly.
+                        if result_tx.send(decoded).is_err() {
+                            break;
+                        }
                     }
-                }
-            });
+                })?;
         }
 
         // Dispatcher thread: feed in-range blocks to the workers in sequence
@@ -966,43 +968,45 @@ fn write_vcd_value_changes<W: Write>(
         // thread observes it; a shutdown (writer stopped early) aborts dispatch.
         let dispatch_tx = result_tx.clone();
         let in_flight = &in_flight;
-        scope.spawn(move || {
-            let mut seq = 0u64;
-            // Returns false if the semaphore was shut down, meaning stop.
-            let mut dispatch = |section: Section<std::io::Cursor<Vec<u8>>>| -> bool {
-                if !in_flight.acquire() {
-                    return false;
-                }
-                let _ = work_tx.send(Job { seq, section });
-                seq += 1;
-                true
-            };
+        std::thread::Builder::new()
+            .name("vcd-dispatch".to_string())
+            .spawn_scoped(scope, move || {
+                let mut seq = 0u64;
+                // Returns false if the semaphore was shut down, meaning stop.
+                let mut dispatch = |section: Section<std::io::Cursor<Vec<u8>>>| -> bool {
+                    if !in_flight.acquire() {
+                        return false;
+                    }
+                    let _ = work_tx.send(Job { seq, section });
+                    seq += 1;
+                    true
+                };
 
-            let run = || -> std::io::Result<()> {
-                if !dispatch(first_block) {
-                    return Ok(());
+                let run = || -> std::io::Result<()> {
+                    if !dispatch(first_block) {
+                        return Ok(());
+                    }
+                    while let Some(section) = iterator.next()? {
+                        if !is_value_change(section.block_type()) {
+                            continue;
+                        }
+                        let section = section.buffer()?;
+                        // Stop once a block starts past the range.
+                        if value_change_start_time(&section)? > end {
+                            break;
+                        }
+                        if !dispatch(section) {
+                            break;
+                        }
+                    }
+                    Ok(())
+                };
+                if let Err(err) = run() {
+                    let _ = dispatch_tx.send(Err(err));
                 }
-                while let Some(section) = iterator.next()? {
-                    if !is_value_change(section.block_type()) {
-                        continue;
-                    }
-                    let section = section.buffer()?;
-                    // Stop once a block starts past the range.
-                    if value_change_start_time(&section)? > end {
-                        break;
-                    }
-                    if !dispatch(section) {
-                        break;
-                    }
-                }
-                Ok(())
-            };
-            if let Err(err) = run() {
-                let _ = dispatch_tx.send(Err(err));
-            }
-            // Closing the work channel lets workers finish once drained.
-            drop(work_tx);
-        });
+                // Closing the work channel lets workers finish once drained.
+                drop(work_tx);
+            })?;
 
         // Drop the main thread's spare senders so the result channel closes
         // once every worker and the dispatcher have finished.
