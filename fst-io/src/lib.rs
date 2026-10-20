@@ -1,4 +1,4 @@
-use std::io::{BufRead, Read, Seek, Take, Write};
+use std::io::{BufRead, Cursor, Read, Seek, Take, Write};
 
 use flate2::read::{GzDecoder, ZlibDecoder};
 
@@ -60,11 +60,83 @@ pub enum BlockType {
 /// of the `read_*` methods) or to [`skip`](Section::skip) it. Dropping the
 /// section without fully reading it is also fine: the iterator skips whatever
 /// is left before reading the next section.
-pub struct Section<'a, R> {
+pub struct Section<R> {
     pub block_type: u8,
     pub len: u64,
     /// The iterator's reader, limited to the remaining bytes of this section.
-    pub data: &'a mut Take<R>,
+    pub data: R,
+}
+
+impl<R: Read> Section<R> {
+    /// Reads the whole section into memory and returns an owned, seekable
+    /// section backed by that buffer.
+    ///
+    /// Sections borrowed from a [`SectionIterator`] seek through the underlying
+    /// file; buffering detaches a section from the iterator so it can be held
+    /// and read independently (for example, decoded on a worker while the
+    /// iterator moves on). The random-access `read_*` methods work on either
+    /// form, since both the borrowed reader and the buffer implement
+    /// [`SectionData`].
+    pub fn buffer(self) -> std::io::Result<Section<Cursor<Vec<u8>>>> {
+        let mut data = Vec::with_capacity(to_usize(self.len).unwrap_or(0));
+        let read = self.data.take(self.len).read_to_end(&mut data)?;
+        if read as u64 != self.len {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        Ok(Section {
+            block_type: self.block_type,
+            len: self.len,
+            data: Cursor::new(data),
+        })
+    }
+}
+
+/// A reader positioned within a single section, able to report and change its
+/// offset relative to the start of the section data.
+///
+/// This is what lets the `read_*` methods be generic over how a section is
+/// backed. The borrowed form (`&mut Take<R>`, handed out by
+/// [`SectionIterator`]) seeks the underlying file and keeps the `Take` limit in
+/// step; the owned form ([`Cursor<Vec<u8>>`], from [`Section::buffer`]) seeks
+/// its in-memory buffer directly.
+///
+/// `section_len` is passed in rather than stored because the borrowed form only
+/// knows how many bytes are *left* (the `Take` limit), not where the section
+/// began; the owning `ValueChangeBlock`/`Section` always knows its own length.
+pub trait SectionData: Read {
+    /// Current offset from the start of the section data.
+    fn section_position(&self, section_len: u64) -> u64;
+    /// Seeks to `position`, an offset from the start of the section data.
+    fn section_seek_to(&mut self, position: u64, section_len: u64) -> std::io::Result<()>;
+}
+
+impl<R: Read + Seek> SectionData for &mut Take<R> {
+    fn section_position(&self, section_len: u64) -> u64 {
+        // `set_limit(section_len)` is established when the section begins and
+        // every read decrements the limit, so the consumed prefix is the
+        // difference.
+        section_len - self.limit()
+    }
+
+    fn section_seek_to(&mut self, position: u64, section_len: u64) -> std::io::Result<()> {
+        let current = section_len - self.limit();
+        let offset = i64::try_from(position).map_err(|_| invalid_data("section too large"))?
+            - i64::try_from(current).map_err(|_| invalid_data("section too large"))?;
+        self.get_mut().seek_relative(offset)?;
+        self.set_limit(section_len - position);
+        Ok(())
+    }
+}
+
+impl SectionData for Cursor<Vec<u8>> {
+    fn section_position(&self, _section_len: u64) -> u64 {
+        self.position()
+    }
+
+    fn section_seek_to(&mut self, position: u64, _section_len: u64) -> std::io::Result<()> {
+        self.set_position(position);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -149,13 +221,13 @@ impl HeaderBlock {
     }
 }
 
-impl<R: Read> Read for Section<'_, R> {
+impl<R: Read> Read for Section<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.data.read(buf)
     }
 }
 
-impl<R> Section<'_, R> {
+impl<R> Section<R> {
     /// Length of the section data, in bytes (excluding block type and length fields).
     pub fn len(&self) -> u64 {
         self.len
@@ -179,7 +251,7 @@ impl<R> Section<'_, R> {
     }
 }
 
-impl<R: Read> Section<'_, R> {
+impl<R: Read> Section<R> {
     /// Writes the whole section, including the block type and length, to `out`.
     ///
     /// The section data must not have been read yet.
@@ -206,7 +278,7 @@ pub fn write_section_header<W: Write>(
     out.write_all(&(len + 8).to_be_bytes())
 }
 
-impl<R: Read + Seek> Section<'_, R> {
+impl<R: Read + Seek> Section<R> {
     /// Reads the section as a header block.
     pub fn read_header(mut self) -> std::io::Result<HeaderBlock> {
         if self.block_type != BlockType::Header as u8 {
@@ -270,12 +342,12 @@ impl<R: Read + Seek> Section<'_, R> {
     }
 }
 
-impl<'a, R: Read> Section<'a, R> {
+impl<R: Read> Section<R> {
     /// Reads the section as a geometry block.
     ///
     /// Only the fixed size fields are read; the length entries are read lazily
     /// through [`GeometryBlock::lengths`].
-    pub fn read_geometry(mut self) -> std::io::Result<GeometryBlock<'a, R>> {
+    pub fn read_geometry(mut self) -> std::io::Result<GeometryBlock<R>> {
         if self.block_type != BlockType::Geometry as u8 {
             return Err(invalid_data("section is not a geometry block"));
         }
@@ -286,9 +358,17 @@ impl<'a, R: Read> Section<'a, R> {
         let uncompressed_length = u64::from_be_bytes(fields[0..8].try_into().unwrap());
         let count = u64::from_be_bytes(fields[8..16].try_into().unwrap());
 
+        // The data that follows the 16 fixed-size fields is the (possibly
+        // compressed) length table, read sequentially to the end of the
+        // section.
+        let compressed_length = self
+            .len
+            .checked_sub(16)
+            .ok_or_else(|| invalid_data("geometry block too short"))?;
+
         Ok(GeometryBlock {
             uncompressed_length,
-            compressed_length: self.data.limit(),
+            compressed_length,
             count,
             data: self.data,
         })
@@ -296,7 +376,7 @@ impl<'a, R: Read> Section<'a, R> {
 }
 
 /// Geometry block: the length of each variable in bits.
-pub struct GeometryBlock<'a, R> {
+pub struct GeometryBlock<R> {
     /// Length of the uncompressed data. Equal to `compressed_length` if the data
     /// is not compressed.
     pub uncompressed_length: u64,
@@ -304,17 +384,17 @@ pub struct GeometryBlock<'a, R> {
     pub compressed_length: u64,
     /// Number of length entries in the data.
     pub count: u64,
-    /// The section reader, limited to the geometry data.
-    pub data: &'a mut Take<R>,
+    /// The section reader, positioned at the start of the length table.
+    pub data: R,
 }
 
-impl<'a, R: Read> GeometryBlock<'a, R> {
+impl<R: Read> GeometryBlock<R> {
     pub fn is_compressed(&self) -> bool {
         self.uncompressed_length != self.compressed_length
     }
 
     /// Returns an iterator over the length of each variable.
-    pub fn lengths(self) -> GeometryLengths<GeometryData<'a, R>> {
+    pub fn lengths(self) -> GeometryLengths<GeometryData<R>> {
         let data = if self.is_compressed() {
             GeometryData::Zlib(ZlibDecoder::new(self.data))
         } else {
@@ -342,12 +422,12 @@ pub enum VariableLength {
 }
 
 /// The geometry data, decompressed if needed.
-pub enum GeometryData<'a, R> {
-    Raw(&'a mut Take<R>),
-    Zlib(ZlibDecoder<&'a mut Take<R>>),
+pub enum GeometryData<R> {
+    Raw(R),
+    Zlib(ZlibDecoder<R>),
 }
 
-impl<R: Read> Read for GeometryData<'_, R> {
+impl<R: Read> Read for GeometryData<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             GeometryData::Raw(data) => data.read(buf),
@@ -410,12 +490,12 @@ fn read_varint<R: Read>(reader: &mut R) -> std::io::Result<u64> {
     }
 }
 
-impl<'a, R: Read> Section<'a, R> {
+impl<R: Read> Section<R> {
     /// Reads the section as a hierarchy block.
     ///
     /// Only the fixed size fields are read; the entries are decompressed and
     /// read by [`HierarchyBlock::entries`].
-    pub fn read_hierarchy(mut self) -> std::io::Result<HierarchyBlock<'a, R>> {
+    pub fn read_hierarchy(mut self) -> std::io::Result<HierarchyBlock<R>> {
         let mut uncompressed_length = [0u8; 8];
         self.read_exact(&mut uncompressed_length)?;
         let uncompressed_length = u64::from_be_bytes(uncompressed_length);
@@ -451,20 +531,20 @@ pub enum HierarchyCompression {
 }
 
 /// Hierarchy block: the design hierarchy and all signal names.
-pub struct HierarchyBlock<'a, R> {
+pub struct HierarchyBlock<R> {
     pub compression: HierarchyCompression,
     /// Length of the hierarchy data after decompression.
     pub uncompressed_length: u64,
-    /// The section reader, limited to the compressed hierarchy data.
-    pub data: &'a mut Take<R>,
+    /// The section reader, positioned at the start of the compressed data.
+    pub data: R,
 }
 
-impl<'a, R: Read> HierarchyBlock<'a, R> {
+impl<R: Read> HierarchyBlock<R> {
     /// Returns an iterator over the hierarchy entries.
     ///
     /// Gzip data is decompressed while iterating. LZ4 data can only be
     /// decompressed as a whole, so it is read and decompressed here.
-    pub fn entries(self) -> std::io::Result<HierarchyEntries<HierarchyData<'a, R>>> {
+    pub fn entries(self) -> std::io::Result<HierarchyEntries<HierarchyData<R>>> {
         let data = match self.compression {
             HierarchyCompression::Gzip => {
                 HierarchyData::Gzip(std::io::BufReader::new(GzDecoder::new(self.data)))
@@ -492,13 +572,14 @@ impl<'a, R: Read> HierarchyBlock<'a, R> {
     }
 }
 
-fn read_to_vec<R: Read>(reader: &mut Take<R>) -> std::io::Result<Vec<u8>> {
-    let len = usize::try_from(reader.limit()).map_err(|_| invalid_data("section too large"))?;
-    let mut data = Vec::with_capacity(len);
+/// Reads the rest of `reader` to the end of the section.
+///
+/// Both section readers stop at the section boundary on their own -- the
+/// borrowed `Take<R>` at its limit, the buffered `Cursor` at the end of its
+/// buffer -- so a plain `read_to_end` captures exactly the section data.
+fn read_to_vec<R: Read>(mut reader: R) -> std::io::Result<Vec<u8>> {
+    let mut data = Vec::new();
     reader.read_to_end(&mut data)?;
-    if data.len() != len {
-        return Err(std::io::ErrorKind::UnexpectedEof.into());
-    }
     Ok(data)
 }
 
@@ -515,12 +596,12 @@ fn lz4_decompress(input: &[u8], len: u64) -> std::io::Result<Vec<u8>> {
 }
 
 /// The hierarchy data, after decompression.
-pub enum HierarchyData<'a, R> {
-    Gzip(std::io::BufReader<GzDecoder<&'a mut Take<R>>>),
+pub enum HierarchyData<R> {
+    Gzip(std::io::BufReader<GzDecoder<R>>),
     Buffer(std::io::Cursor<Vec<u8>>),
 }
 
-impl<R: Read> Read for HierarchyData<'_, R> {
+impl<R: Read> Read for HierarchyData<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             HierarchyData::Gzip(data) => data.read(buf),
@@ -529,7 +610,7 @@ impl<R: Read> Read for HierarchyData<'_, R> {
     }
 }
 
-impl<R: Read> BufRead for HierarchyData<'_, R> {
+impl<R: Read> BufRead for HierarchyData<R> {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
         match self {
             HierarchyData::Gzip(data) => data.fill_buf(),
@@ -741,13 +822,13 @@ fn read_name<R: BufRead>(reader: &mut R) -> std::io::Result<Vec<u8>> {
     Ok(name)
 }
 
-impl<'a, R: Read + Seek> Section<'a, R> {
+impl<R: SectionData> Section<R> {
     /// Reads the section as a value change block.
     ///
     /// Reads only the fixed size fields at the start of the section. The
     /// tables are located by [`ValueChangeBlock::read_head_layout`] and
     /// [`ValueChangeBlock::read_tail_layout`], and read on demand.
-    pub fn read_value_changes(mut self) -> std::io::Result<ValueChangeBlock<'a, R>> {
+    pub fn read_value_changes(mut self) -> std::io::Result<ValueChangeBlock<R>> {
         let block_type = match self.block_type() {
             Some(
                 block_type @ (BlockType::ValueChangeData
@@ -783,7 +864,7 @@ impl<'a, R: Read + Seek> Section<'a, R> {
 /// The block holds no derived state. The caller locates the tables with
 /// [`HeadLayout`] and [`TailLayout`], and passes them to the methods that read
 /// the tables.
-pub struct ValueChangeBlock<'a, R> {
+pub struct ValueChangeBlock<R> {
     pub block_type: BlockType,
     /// Start time of the block, in units of the header timescale.
     pub start_time: u64,
@@ -794,7 +875,7 @@ pub struct ValueChangeBlock<'a, R> {
     /// Length of the section data.
     pub len: u64,
     /// The section reader.
-    pub data: &'a mut Take<R>,
+    pub data: R,
 }
 
 /// Fields of a value change block located by seeking from the start of the
@@ -840,10 +921,10 @@ pub enum WavePosition {
     Alias(u64),
 }
 
-impl<'a, R: Read + Seek> ValueChangeBlock<'a, R> {
+impl<R: SectionData> ValueChangeBlock<R> {
     /// Current position, relative to the start of the section data.
     fn position(&self) -> u64 {
-        self.len - self.data.limit()
+        self.data.section_position(self.len)
     }
 
     /// Seeks to `position`, relative to the start of the section data.
@@ -851,11 +932,7 @@ impl<'a, R: Read + Seek> ValueChangeBlock<'a, R> {
         if position > self.len {
             return Err(invalid_data("offset past end of value change block"));
         }
-        let offset = i64::try_from(position).map_err(|_| invalid_data("section too large"))?
-            - i64::try_from(self.position()).map_err(|_| invalid_data("section too large"))?;
-        self.data.get_mut().seek_relative(offset)?;
-        self.data.set_limit(self.len - position);
-        Ok(())
+        self.data.section_seek_to(position, self.len)
     }
 
     /// Reads `length` bytes at `position`.
@@ -886,15 +963,15 @@ impl<'a, R: Read + Seek> ValueChangeBlock<'a, R> {
     pub fn read_head_layout(&mut self) -> std::io::Result<HeadLayout> {
         // The fixed size fields, read by `read_value_changes`, come first.
         self.seek_to(24)?;
-        let bits_uncompressed_length = read_varint(self.data)?;
-        let bits_compressed_length = read_varint(self.data)?;
-        let bits_count = read_varint(self.data)?;
+        let bits_uncompressed_length = read_varint(&mut self.data)?;
+        let bits_compressed_length = read_varint(&mut self.data)?;
+        let bits_count = read_varint(&mut self.data)?;
 
         let bits_start = self.position();
         self.seek_to(checked_add(bits_start, bits_compressed_length)?)?;
-        let waves_count = read_varint(self.data)?;
+        let waves_count = read_varint(&mut self.data)?;
         let waves_start = self.position();
-        let pack_type = read_u8(self.data)?;
+        let pack_type = read_u8(&mut self.data)?;
 
         Ok(HeadLayout {
             bits_start,
@@ -1009,6 +1086,7 @@ impl<'a, R: Read + Seek> ValueChangeBlock<'a, R> {
     ///
     /// `positions` is the table from [`Self::read_positions`]. `length` is the
     /// variable length from the geometry block, needed to decode the waves.
+    #[inline(never)]
     pub fn read_waves(
         &mut self,
         head: &HeadLayout,
@@ -1442,20 +1520,22 @@ fn skip_remaining<R: Seek>(reader: &mut Take<R>) -> std::io::Result<()> {
 
 pub struct SectionIterator<R: Read + Seek> {
     /// Limited to the bytes left unread in the last returned section.
-    pub reader: Take<R>,
+    pub reader: R,
 }
 
-impl<R: Read + Seek> SectionIterator<R> {
-    pub fn new(reader: R) -> Self {
+impl<R: Read + Seek> SectionIterator<Take<R>> {
+    pub fn new(reader: R) -> SectionIterator<Take<R>> {
         Self {
             reader: reader.take(0),
         }
     }
+}
 
+impl<R: Read + Seek> SectionIterator<Take<R>> {
     /// Returns the next section, or `None` at end of file.
     ///
     /// Any data left unread in the previous section is skipped first.
-    pub fn next(&mut self) -> std::io::Result<Option<Section<'_, R>>> {
+    pub fn next(&mut self) -> std::io::Result<Option<Section<&mut Take<R>>>> {
         skip_remaining(&mut self.reader)?;
         let reader = self.reader.get_mut();
 
