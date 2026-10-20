@@ -37,6 +37,25 @@ enum Command {
         #[arg(long, requires = "hier")]
         names: bool,
     },
+    /// Convert a file to VCD, optionally only a slice of the time range.
+    ///
+    /// The whole hierarchy is always written. Only the value changes whose
+    /// time is within the range are dumped; the state at the start of the
+    /// range is written as the initial `$dumpvars`.
+    Vcd {
+        /// The FST file to read.
+        input: PathBuf,
+        /// The VCD file to write. Defaults to standard output.
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+        /// First time to dump, in units of the file timescale. Defaults to the
+        /// start of the file.
+        #[arg(long)]
+        start_time: Option<u64>,
+        /// Last time to dump (inclusive). Defaults to the end of the file.
+        #[arg(long)]
+        end_time: Option<u64>,
+    },
     /// Copy a file, keeping only the value change blocks that overlap a time
     /// range.
     ///
@@ -68,6 +87,12 @@ fn main() -> std::io::Result<()> {
         Command::Info {
             input, flat, names, ..
         } => info_hierarchy(&input, flat, names),
+        Command::Vcd {
+            input,
+            output,
+            start_time,
+            end_time,
+        } => vcd(&input, output.as_deref(), start_time, end_time),
         Command::Splice {
             input,
             start_time,
@@ -405,6 +430,622 @@ fn splice(input: &Path, start_time: u64, end_time: u64, output: &Path) -> std::i
     Ok(())
 }
 
+/// FST_VT_VCD_PORT: the length field is a raw value, not a bit count.
+const VAR_TYPE_PORT: u8 = 18;
+
+/// Builds an `InvalidData` I/O error with a static message.
+fn invalid_data(msg: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
+}
+
+/// Variable types whose VCD length is fixed at 64 bits (an f64 real).
+fn is_real_var(var_type: u8) -> bool {
+    // real, real_parameter, realtime.
+    matches!(var_type, 3 | 4 | 20)
+}
+
+/// FST_VT_SV_SHORTREAL: a 32-bit real.
+const VAR_TYPE_SHORTREAL: u8 = 29;
+
+/// Encodes an FST variable id as a VCD identifier code: base 94 starting at
+/// '!', least significant digit first. The id is 1-based (0 is illegal).
+///
+/// This matches `fstVcdID` in the reference C library.
+fn vcd_id(mut id: u64) -> String {
+    let mut code = String::new();
+    while id != 0 {
+        id -= 1;
+        code.push((b'!' + (id % 94) as u8) as char);
+        id /= 94;
+    }
+    code
+}
+
+/// Renders the FST `timescale` exponent as a VCD time unit, e.g. `1ns` or
+/// `100ps`. Matches the mapping in the reference C library.
+fn timescale_label(timescale: i8) -> String {
+    // The exponent splits into a decade within a unit (10^0, 10^1, 10^2) and a
+    // unit (s, ms, us, ns, ps, fs, as, zs). An exponent above 2 or below the
+    // smallest unit is clamped the way the reference does, to seconds or to
+    // the smallest unit.
+    let (scale, unit) = match timescale {
+        e if e >= 2 => (100, ""),
+        1 => (10, ""),
+        0 => (1, ""),
+        -1 => (100, "m"),
+        -2 => (10, "m"),
+        -3 => (1, "m"),
+        -4 => (100, "u"),
+        -5 => (10, "u"),
+        -6 => (1, "u"),
+        -7 => (100, "n"),
+        -8 => (10, "n"),
+        -9 => (1, "n"),
+        -10 => (100, "p"),
+        -11 => (10, "p"),
+        -12 => (1, "p"),
+        -13 => (100, "f"),
+        -14 => (10, "f"),
+        -15 => (1, "f"),
+        -16 => (100, "a"),
+        -17 => (10, "a"),
+        -18 => (1, "a"),
+        -19 => (100, "z"),
+        -20 => (10, "z"),
+        _ => (1, "z"),
+    };
+    format!("{scale}{unit}s")
+}
+
+/// A null-terminated fixed field, as a lossy string with trailing content
+/// after the first NUL dropped.
+fn c_string(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+/// Per-variable information needed to write value changes: the VCD identifier
+/// code, the bit length from the geometry block, and whether it is a port
+/// (which prefixes vectors with `p` instead of `b`).
+struct VcdVar {
+    code: String,
+    length: VariableLength,
+    is_port: bool,
+}
+
+/// Formats an f64 real the way the reference C library does, with `%.16g`.
+fn format_real(bytes: [u8; 8], endianness: RealEndianess) -> String {
+    let value = match endianness {
+        RealEndianess::LittleEndian => f64::from_le_bytes(bytes),
+        RealEndianess::BigEndian => f64::from_be_bytes(bytes),
+    };
+    // `%.16g` prints up to 16 significant digits, trimming trailing zeros.
+    format_g(value, 16)
+}
+
+/// A minimal `%.*g` formatter: `precision` significant digits, shortest of
+/// fixed and scientific, trailing zeros trimmed. Dependency-free.
+fn format_g(value: f64, precision: usize) -> String {
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    if !value.is_finite() {
+        // VCD has no representation for these; emit a readable token.
+        return format!("{value}");
+    }
+    let precision = precision.max(1);
+    let exp = value.abs().log10().floor() as i32;
+    // %g uses scientific notation when the exponent is < -4 or >= precision.
+    if exp < -4 || exp >= precision as i32 {
+        let mut s = format!("{:.*e}", precision - 1, value);
+        trim_mantissa_in_exp(&mut s);
+        s
+    } else {
+        let decimals = (precision as i32 - 1 - exp).max(0) as usize;
+        let s = format!("{value:.decimals$}");
+        trim_trailing_zeros(s)
+    }
+}
+
+/// Trims trailing zeros (and a dangling decimal point) from a fixed-notation
+/// number.
+fn trim_trailing_zeros(s: String) -> String {
+    if !s.contains('.') {
+        return s;
+    }
+    let trimmed = s.trim_end_matches('0');
+    trimmed.trim_end_matches('.').to_string()
+}
+
+/// Trims trailing zeros from the mantissa of a Rust `{:e}` string, and drops a
+/// `+` is never emitted by Rust so only the mantissa needs fixing.
+fn trim_mantissa_in_exp(s: &mut String) {
+    if let Some(e) = s.find('e') {
+        let (mantissa, exp) = s.split_at(e);
+        let mantissa = trim_trailing_zeros(mantissa.to_string());
+        *s = format!("{mantissa}{exp}");
+    }
+}
+
+/// Converts an FST file to VCD, dumping only value changes whose time is
+/// within `[start_time, end_time]` (defaulting to the whole file).
+fn vcd(
+    input: &Path,
+    output: Option<&Path>,
+    start_time: Option<u64>,
+    end_time: Option<u64>,
+) -> std::io::Result<()> {
+    if let (Some(start), Some(end)) = (start_time, end_time)
+        && start > end
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "start time is after end time",
+        ));
+    }
+
+    let open = || -> std::io::Result<_> { Ok(BufReader::new(std::fs::File::open(input)?)) };
+
+    // First pass: read the header and geometry. The geometry comes after the
+    // value change blocks, but the lengths are needed to decode them, so the
+    // file is read in two passes.
+    let mut header = None;
+    let mut lengths = None;
+    let mut iterator = SectionIterator::new(open()?);
+    while let Some(section) = iterator.next()? {
+        match section.block_type() {
+            Some(BlockType::Header) => header = Some(section.read_header()?),
+            Some(BlockType::Geometry) => {
+                lengths = Some(
+                    section
+                        .read_geometry()?
+                        .lengths()
+                        .collect::<std::io::Result<Vec<_>>>()?,
+                );
+            }
+            _ => {}
+        }
+    }
+    let header = header.ok_or_else(|| invalid_data("file has no header block"))?;
+    let lengths = lengths.ok_or_else(|| invalid_data("file has no geometry block"))?;
+
+    let start = start_time.unwrap_or(header.start_time);
+    let end = end_time.unwrap_or(header.end_time);
+
+    let mut out: Box<dyn Write> = match output {
+        Some(path) => Box::new(std::fs::File::create(path)?),
+        None => Box::new(std::io::stdout().lock()),
+    };
+    let mut out = BufWriter::new(&mut *out);
+
+    // Second pass over the hierarchy: write the VCD header and declarations,
+    // and build the per-variable table indexed by variable id.
+    write_vcd_header(&mut out, &header)?;
+    let vars = write_vcd_declarations(&mut out, input, &lengths)?;
+    writeln!(out, "$enddefinitions $end")?;
+
+    write_vcd_value_changes(&mut out, input, &lengths, &vars, &header, start, end)?;
+
+    out.flush()
+}
+
+/// Writes the `$date`, `$version`, `$timezero` and `$timescale` sections.
+fn write_vcd_header<W: Write>(out: &mut W, header: &HeaderBlock) -> std::io::Result<()> {
+    // asctime() leaves a trailing newline inside the field; the reference
+    // writes the date verbatim, so `$date\n\t<date>\n$end` keeps that newline
+    // and produces the blank line before `$end`.
+    writeln!(out, "$date\n\t{}\n$end", c_string(&header.date))?;
+    writeln!(out, "$version\n\t{}\n$end", c_string(&header.writer))?;
+    if header.timezero != 0 {
+        writeln!(out, "$timezero\n\t{}\n$end", header.timezero)?;
+    }
+    writeln!(
+        out,
+        "$timescale\n\t{}\n$end",
+        timescale_label(header.timescale)
+    )
+}
+
+/// Writes the `$scope`/`$var`/`$upscope` declarations, returning a map from
+/// variable id to its VCD metadata. Every declared variable (including
+/// aliases) gets a `$var` line sharing the aliased id's code.
+fn write_vcd_declarations<W: Write>(
+    out: &mut W,
+    input: &Path,
+    lengths: &[VariableLength],
+) -> std::io::Result<std::collections::HashMap<u64, VcdVar>> {
+    let mut vars: std::collections::HashMap<u64, VcdVar> = std::collections::HashMap::new();
+    // The geometry lengths are indexed by non-aliased variable id - 1.
+    let mut next_length = 0usize;
+    let mut unnamed_scope = 0u32;
+
+    for_each_hierarchy_entry(input, |entry| {
+        match entry {
+            HierarchyEntry::Scope {
+                scope_type, name, ..
+            } => {
+                let type_name = scope_type_name(scope_type).unwrap_or("module");
+                let name = String::from_utf8_lossy(&name).into_owned();
+                if name.is_empty() {
+                    writeln!(
+                        out,
+                        "$scope {type_name} $unnamed_scope_{unnamed_scope} $end"
+                    )?;
+                    unnamed_scope += 1;
+                } else {
+                    writeln!(out, "$scope {type_name} {name} $end")?;
+                }
+            }
+            HierarchyEntry::UpScope => writeln!(out, "$upscope $end")?,
+            HierarchyEntry::Var {
+                var_type,
+                name,
+                length,
+                id,
+                is_alias,
+                direction: _,
+            } => {
+                let name = String::from_utf8_lossy(&name).into_owned();
+                let type_name = var_type_name(var_type).unwrap_or("wire");
+                // The VCD identifier code is 1-based; fst-io ids are 0-based.
+                let code = vcd_id(id + 1);
+                // The VCD length: ports pack three VCD chars per bit, reals are
+                // fixed width, everything else is the bit length.
+                let vcd_length = if var_type == VAR_TYPE_PORT {
+                    length.saturating_sub(2) / 3
+                } else if is_real_var(var_type) {
+                    64
+                } else if var_type == VAR_TYPE_SHORTREAL {
+                    32
+                } else {
+                    length
+                };
+                writeln!(out, "$var {type_name} {vcd_length} {code} {name} $end")?;
+
+                // A non-aliased variable consumes the next geometry length and
+                // becomes the id's canonical decode info. An alias reuses the
+                // aliased id's entry (already recorded or recorded later in
+                // declaration order, which always precedes its aliases).
+                if !is_alias {
+                    let geometry_length = lengths
+                        .get(next_length)
+                        .copied()
+                        .ok_or_else(|| invalid_data("more variables than geometry lengths"))?;
+                    next_length += 1;
+                    vars.entry(id).or_insert(VcdVar {
+                        code,
+                        length: geometry_length,
+                        is_port: var_type == VAR_TYPE_PORT,
+                    });
+                }
+            }
+            HierarchyEntry::AttributeBegin { .. } | HierarchyEntry::AttributeEnd => {}
+        }
+        Ok(())
+    })?;
+
+    Ok(vars)
+}
+
+/// Dumps the value changes within `[start, end]`.
+///
+/// FST value-change blocks are time-ordered and disjoint: every time in block
+/// N precedes every time in block N+1. So the whole dump is already in time
+/// order block-by-block, and only one block's changes are ever held in memory
+/// at a time -- this streams arbitrarily large files. Within a single block,
+/// changes are gathered per variable (each variable's waves are time-ordered)
+/// and stably sorted by time before being emitted.
+///
+/// The output mirrors the reference C library: when the dump begins exactly at
+/// the first block's first time step (the whole file, from the start), the
+/// first time step's changes are wrapped in `$dumpvars` and no separate
+/// initial frame is written. When the dump starts mid-stream -- a later
+/// `--start-time`, or any block skipped before the range -- the state carried
+/// into the range is written first as a `$dumpvars` frame.
+fn write_vcd_value_changes<W: Write>(
+    out: &mut W,
+    input: &Path,
+    lengths: &[VariableLength],
+    vars: &std::collections::HashMap<u64, VcdVar>,
+    header: &HeaderBlock,
+    start: u64,
+    end: u64,
+) -> std::io::Result<()> {
+    let real_endianness = header.real_endianness;
+
+    // Variable ids in geometry order, so the bits array can be mapped to ids.
+    let mut ids: Vec<u64> = Vec::new();
+    for_each_hierarchy_entry(input, |entry| {
+        if let HierarchyEntry::Var { id, is_alias, .. } = entry
+            && !is_alias
+        {
+            ids.push(id);
+        }
+        Ok(())
+    })?;
+
+    // The state of each variable at the start of the dumped range, built from
+    // the initial bits array and pre-range changes of every block up to and
+    // including the first dumped one. Indexed by (0-based) non-aliased id.
+    let mut baseline: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+    let mut baseline_real: std::collections::HashMap<u64, [u8; 8]> =
+        std::collections::HashMap::new();
+
+    // Reused per-block scratch for one block's in-range changes. Holding a
+    // single block -- never the whole file -- is what keeps memory bounded.
+    let mut changes: Vec<(u64, u64, RenderedValue)> = Vec::new();
+
+    // Set true if any block entirely before the range was skipped.
+    let mut blocks_skipped = false;
+    // Has the first in-range block been reached and its framing decided?
+    let mut emitting = false;
+    // dumpvars state machine, only used on the no-frame path: 0 = not started,
+    // 1 = inside dumpvars, 2 = closed. Persists across blocks.
+    let mut dumpvars_state = 0u8;
+    // Last `#time` written, to avoid repeating it across block boundaries.
+    let mut current_time: Option<u64> = None;
+
+    let mut iterator = SectionIterator::new(std::fs::File::open(input)?);
+    while let Some(section) = iterator.next()? {
+        if !is_value_change(section.block_type()) {
+            continue;
+        }
+        let mut block = section.read_value_changes()?;
+        let block_start = block.start_time;
+
+        if block.end_time < start {
+            // Before the range: fold its final state into the baseline. The
+            // bits array is the state at the block's own start, and its changes
+            // carry it forward, so the latest value of each variable wins.
+            let head = block.read_head_layout()?;
+            let tail = block.read_tail_layout()?;
+            let positions = block.read_positions(&head, &tail)?;
+            let bits = block.read_bits(&head)?;
+            for (index, value) in bits.values(lengths).enumerate() {
+                let value = value?;
+                if let Some(&id) = ids.get(index) {
+                    update_baseline(&mut baseline, &mut baseline_real, id, &value);
+                }
+            }
+            for (geometry_index, &id) in ids.iter().enumerate() {
+                let waves = block.read_waves(&head, &positions, id, lengths[geometry_index])?;
+                for change in waves.iter() {
+                    let (_, value) = change?;
+                    update_baseline(&mut baseline, &mut baseline_real, id, &value);
+                }
+            }
+            blocks_skipped = true;
+            continue;
+        }
+        if block_start > end {
+            break;
+        }
+
+        let head = block.read_head_layout()?;
+        let tail = block.read_tail_layout()?;
+        let positions = block.read_positions(&head, &tail)?;
+        let times = block.read_time_table(&tail)?;
+        let first_time = times.first().copied().unwrap_or(block_start);
+
+        // Fold the first in-range block's initial bits array into the baseline;
+        // its pre-`start` changes (below) finish carrying the state to `start`.
+        let is_first_block = !emitting;
+        if is_first_block {
+            let bits = block.read_bits(&head)?;
+            for (index, value) in bits.values(lengths).enumerate() {
+                let value = value?;
+                if let Some(&id) = ids.get(index) {
+                    update_baseline(&mut baseline, &mut baseline_real, id, &value);
+                }
+            }
+        }
+
+        // Collect this block's in-range changes (one block in memory at a
+        // time); pre-range changes advance the baseline instead.
+        changes.clear();
+        for (geometry_index, &id) in ids.iter().enumerate() {
+            let waves = block.read_waves(&head, &positions, id, lengths[geometry_index])?;
+            for change in waves.iter() {
+                let (time_index, value) = change?;
+                let time = times
+                    .get(time_index as usize)
+                    .copied()
+                    .ok_or_else(|| invalid_data("time index out of range"))?;
+                if time < start {
+                    update_baseline(&mut baseline, &mut baseline_real, id, &value);
+                    continue;
+                }
+                if time > end {
+                    continue;
+                }
+                changes.push((time, id, RenderedValue::from_value(&value)));
+            }
+        }
+        // Stable sort by time keeps per-variable order within a time step.
+        changes.sort_by_key(|&(time, _, _)| time);
+
+        if is_first_block {
+            // A separate initial frame is written when the dump does not begin
+            // exactly at the first block's first time step: a later start time,
+            // a skipped block, or a block whose first time is after its start.
+            let needs_frame = blocks_skipped || start > first_time || block_start != first_time;
+            if needs_frame {
+                let frame_time = block_start.max(start);
+                writeln!(out, "#{frame_time}")?;
+                writeln!(out, "$dumpvars")?;
+                write_baseline(out, &ids, vars, &baseline, &baseline_real, real_endianness)?;
+                writeln!(out, "$end")?;
+                current_time = Some(frame_time);
+                // The frame already played the dumpvars role; treat it closed.
+                dumpvars_state = 2;
+            }
+            emitting = true;
+        }
+
+        emit_block_changes(
+            out,
+            &changes,
+            vars,
+            real_endianness,
+            &mut dumpvars_state,
+            &mut current_time,
+        )?;
+    }
+
+    // Close a dumpvars section left open by a single-time-step dump.
+    if dumpvars_state == 1 {
+        writeln!(out, "$end")?;
+    }
+
+    Ok(())
+}
+
+/// Emits one block's already-sorted changes, carrying the `$dumpvars` state
+/// machine and the last-written `#time` across block boundaries so the whole
+/// stream reads as one time-ordered dump.
+fn emit_block_changes<W: Write>(
+    out: &mut W,
+    changes: &[(u64, u64, RenderedValue)],
+    vars: &std::collections::HashMap<u64, VcdVar>,
+    real_endianness: RealEndianess,
+    dumpvars_state: &mut u8,
+    current_time: &mut Option<u64>,
+) -> std::io::Result<()> {
+    for (time, id, value) in changes {
+        if *current_time != Some(*time) {
+            // The reference opens `$dumpvars` at the first dumped time and
+            // closes it at the second; on the frame path the state starts
+            // closed so neither happens here.
+            if *dumpvars_state == 1 {
+                writeln!(out, "$end")?;
+                *dumpvars_state = 2;
+            }
+            writeln!(out, "#{time}")?;
+            if *dumpvars_state == 0 {
+                writeln!(out, "$dumpvars")?;
+                *dumpvars_state = 1;
+            }
+            *current_time = Some(*time);
+        }
+        if let Some(var) = vars.get(id) {
+            value.write(out, var, real_endianness)?;
+        }
+    }
+    Ok(())
+}
+
+/// An owned value change, decoupled from the block's borrowed buffers.
+enum RenderedValue {
+    Bit(u8),
+    Real([u8; 8]),
+    VarLen(Vec<u8>),
+    Vector(Vec<u8>),
+}
+
+impl RenderedValue {
+    fn from_value(value: &Value) -> Self {
+        match value {
+            Value::Bit(bit) => RenderedValue::Bit(*bit),
+            Value::Real(bytes) => RenderedValue::Real(*bytes),
+            Value::VarLen(data) => RenderedValue::VarLen(data.to_vec()),
+            Value::Packed { .. } | Value::Ascii(_) => RenderedValue::Vector(value.to_ascii()),
+        }
+    }
+
+    fn write<W: Write>(
+        &self,
+        out: &mut W,
+        var: &VcdVar,
+        real_endianness: RealEndianess,
+    ) -> std::io::Result<()> {
+        match self {
+            RenderedValue::Bit(bit) => writeln!(out, "{}{}", *bit as char, var.code),
+            RenderedValue::Real(bytes) => {
+                writeln!(
+                    out,
+                    "r{} {}",
+                    format_real(*bytes, real_endianness),
+                    var.code
+                )
+            }
+            RenderedValue::VarLen(data) => {
+                writeln!(out, "s{} {}", String::from_utf8_lossy(data), var.code)
+            }
+            RenderedValue::Vector(ascii) => {
+                let prefix = if var.is_port { 'p' } else { 'b' };
+                write!(out, "{prefix}")?;
+                out.write_all(ascii)?;
+                writeln!(out, " {}", var.code)
+            }
+        }
+    }
+}
+
+/// Records a variable's initial-state value into the running baseline maps.
+fn update_baseline(
+    baseline: &mut std::collections::HashMap<u64, Vec<u8>>,
+    baseline_real: &mut std::collections::HashMap<u64, [u8; 8]>,
+    id: u64,
+    value: &Value,
+) {
+    match value {
+        Value::Real(bytes) => {
+            baseline_real.insert(id, *bytes);
+        }
+        Value::VarLen(_) => {
+            // Variable-length values have no initial state in a VCD dump.
+        }
+        _ => {
+            baseline.insert(id, value.to_ascii());
+        }
+    }
+}
+
+/// Writes the `$dumpvars` body: the current value of every scalar, vector and
+/// real variable.
+fn write_baseline<W: Write>(
+    out: &mut W,
+    ids: &[u64],
+    vars: &std::collections::HashMap<u64, VcdVar>,
+    baseline: &std::collections::HashMap<u64, Vec<u8>>,
+    baseline_real: &std::collections::HashMap<u64, [u8; 8]>,
+    real_endianness: RealEndianess,
+) -> std::io::Result<()> {
+    for &id in ids {
+        let Some(var) = vars.get(&id) else { continue };
+        if let Some(bytes) = baseline_real.get(&id) {
+            writeln!(
+                out,
+                "r{} {}",
+                format_real(*bytes, real_endianness),
+                var.code
+            )?;
+            continue;
+        }
+        let Some(ascii) = baseline.get(&id) else {
+            continue;
+        };
+        match var.length {
+            VariableLength::Bits(1) => {
+                writeln!(
+                    out,
+                    "{}{}",
+                    ascii.first().copied().unwrap_or(b'x') as char,
+                    var.code
+                )?;
+            }
+            VariableLength::VarLen => {}
+            _ => {
+                let prefix = if var.is_port { 'p' } else { 'b' };
+                write!(out, "{prefix}")?;
+                out.write_all(ascii)?;
+                writeln!(out, " {}", var.code)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn dump(path: &Path) -> std::io::Result<()> {
     let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::new(file);
@@ -510,4 +1151,45 @@ fn dump(path: &Path) -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vcd_id_is_base_94_from_one() {
+        // Id 1 is the first printable code; 94 wraps into a second digit.
+        assert_eq!(vcd_id(1), "!");
+        assert_eq!(vcd_id(2), "\"");
+        assert_eq!(vcd_id(94), "~");
+        assert_eq!(vcd_id(95), "!!");
+        assert_eq!(vcd_id(96), "\"!");
+    }
+
+    #[test]
+    fn timescale_label_maps_exponent_to_unit() {
+        assert_eq!(timescale_label(0), "1s");
+        assert_eq!(timescale_label(1), "10s");
+        assert_eq!(timescale_label(-3), "1ms");
+        assert_eq!(timescale_label(-7), "100ns");
+        assert_eq!(timescale_label(-9), "1ns");
+        assert_eq!(timescale_label(-12), "1ps");
+    }
+
+    #[test]
+    fn format_g_trims_trailing_zeros_and_matches_c() {
+        assert_eq!(format_g(0.0, 16), "0");
+        assert_eq!(format_g(1.25, 16), "1.25");
+        assert_eq!(format_g(-3.5, 16), "-3.5");
+        assert_eq!(format_g(100.0, 16), "100");
+        // A value whose exponent reaches the scientific-notation threshold.
+        assert_eq!(format_g(1e20, 16), "1e20");
+    }
+
+    #[test]
+    fn c_string_stops_at_the_first_nul() {
+        assert_eq!(c_string(b"fstWriter\0\0\0"), "fstWriter");
+        assert_eq!(c_string(b"no terminator"), "no terminator");
+    }
 }
