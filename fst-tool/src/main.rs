@@ -1204,6 +1204,23 @@ impl Semaphore {
     }
 }
 
+/// Writes a `u64` as decimal ASCII directly to `out`, without the `std::fmt`
+/// machinery. The largest `u64` is 20 digits, so a 20-byte scratch buffer
+/// always suffices.
+fn write_u64<W: Write>(out: &mut W, mut value: u64) -> std::io::Result<()> {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    out.write_all(&buf[i..])
+}
+
 /// Emits one block's already-sorted changes, carrying the `$dumpvars` state
 /// machine and the last-written `#time` across block boundaries so the whole
 /// stream reads as one time-ordered dump.
@@ -1221,12 +1238,14 @@ fn emit_block_changes<W: Write>(
             // closes it at the second; on the frame path the state starts
             // closed so neither happens here.
             if *dumpvars_state == 1 {
-                writeln!(out, "$end")?;
+                out.write_all(b"$end\n")?;
                 *dumpvars_state = 2;
             }
-            writeln!(out, "#{time}")?;
+            out.write_all(b"#")?;
+            write_u64(out, *time)?;
+            out.write_all(b"\n")?;
             if *dumpvars_state == 0 {
-                writeln!(out, "$dumpvars")?;
+                out.write_all(b"$dumpvars\n")?;
                 *dumpvars_state = 1;
             }
             *current_time = Some(*time);
@@ -1263,23 +1282,31 @@ impl RenderedValue {
         real_endianness: RealEndianess,
     ) -> std::io::Result<()> {
         match self {
-            RenderedValue::Bit(bit) => writeln!(out, "{}{}", *bit as char, var.code),
+            RenderedValue::Bit(bit) => {
+                out.write_all(&[*bit])?;
+                out.write_all(var.code.as_bytes())?;
+                out.write_all(b"\n")
+            }
             RenderedValue::Real(bytes) => {
-                writeln!(
-                    out,
-                    "r{} {}",
-                    format_real(*bytes, real_endianness),
-                    var.code
-                )
+                out.write_all(b"r")?;
+                out.write_all(format_real(*bytes, real_endianness).as_bytes())?;
+                out.write_all(b" ")?;
+                out.write_all(var.code.as_bytes())?;
+                out.write_all(b"\n")
             }
             RenderedValue::VarLen(data) => {
-                writeln!(out, "s{} {}", String::from_utf8_lossy(data), var.code)
+                out.write_all(b"s")?;
+                out.write_all(data)?;
+                out.write_all(b" ")?;
+                out.write_all(var.code.as_bytes())?;
+                out.write_all(b"\n")
             }
             RenderedValue::Vector(ascii) => {
-                let prefix = if var.is_port { 'p' } else { 'b' };
-                write!(out, "{prefix}")?;
+                out.write_all(if var.is_port { b"p" } else { b"b" })?;
                 out.write_all(ascii)?;
-                writeln!(out, " {}", var.code)
+                out.write_all(b" ")?;
+                out.write_all(var.code.as_bytes())?;
+                out.write_all(b"\n")
             }
         }
     }
