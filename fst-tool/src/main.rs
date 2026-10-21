@@ -58,6 +58,12 @@ enum Command {
         /// Number of worker threads used to decode value-change blocks.
         #[arg(long, short, default_value_t = 3)]
         jobs: usize,
+        /// Only output signals whose full dotted path matches a glob pattern
+        /// (`*`, `?`). A pattern matching a scope's path selects every signal
+        /// under it. Repeatable, and a single argument may list several
+        /// patterns separated by commas. Defaults to every signal.
+        #[arg(long = "signal", value_name = "GLOB", value_delimiter = ',')]
+        signals: Vec<String>,
     },
     /// Copy a file, keeping only the value change blocks that overlap a time
     /// range.
@@ -96,7 +102,15 @@ fn main() -> std::io::Result<()> {
             start_time,
             end_time,
             jobs,
-        } => vcd(&input, output.as_deref(), start_time, end_time, jobs),
+            signals,
+        } => vcd(
+            &input,
+            output.as_deref(),
+            start_time,
+            end_time,
+            jobs,
+            &signals,
+        ),
         Command::Splice {
             input,
             start_time,
@@ -442,6 +456,93 @@ fn invalid_data(msg: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
 }
 
+/// Matches `text` against a glob `pattern` where `*` matches any run of
+/// characters (including none) and `?` matches exactly one. All other
+/// characters match literally. Matching is over bytes, which is correct for
+/// the ASCII path separators and keeps non-UTF-8 names working.
+fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+    // Iterative backtracking match: `star` remembers the last `*` seen and the
+    // text position to resume from if the tentative match fails, giving linear
+    // behavior on the common case without recursion.
+    let (mut p, mut t) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        match pattern.get(p) {
+            Some(b'*') => {
+                star = Some((p, t));
+                p += 1;
+            }
+            Some(b'?') => {
+                p += 1;
+                t += 1;
+            }
+            Some(&c) if c == text[t] => {
+                p += 1;
+                t += 1;
+            }
+            _ => match star {
+                Some((star_p, star_t)) => {
+                    p = star_p + 1;
+                    t = star_t + 1;
+                    star = Some((star_p, t));
+                }
+                None => return false,
+            },
+        }
+    }
+    while pattern.get(p) == Some(&b'*') {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+/// A set of glob patterns selecting which signals to output. An empty filter
+/// selects everything, so the common no-filter path pays nothing.
+///
+/// A pattern is matched against a variable's full dotted path. A pattern that
+/// matches an enclosing scope's dotted path selects every variable under that
+/// scope: the filter tests each path and every prefix that ends at a scope
+/// boundary.
+struct SignalFilter {
+    patterns: Vec<Vec<u8>>,
+}
+
+impl SignalFilter {
+    fn new(patterns: &[String]) -> Self {
+        SignalFilter {
+            patterns: patterns.iter().map(|p| p.clone().into_bytes()).collect(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    /// Whether a variable at `path` (its full dotted path) is selected. `scopes`
+    /// are the enclosing scope names, so a pattern matching any scope-boundary
+    /// prefix selects the variable.
+    fn selects(&self, scopes: &[String], name: &str) -> bool {
+        if self.patterns.is_empty() {
+            return true;
+        }
+        let mut path = String::new();
+        for scope in scopes {
+            path.push_str(scope);
+            path.push('.');
+            let scope_prefix = &path[..path.len() - 1];
+            if self
+                .patterns
+                .iter()
+                .any(|p| glob_match(p, scope_prefix.as_bytes()))
+            {
+                return true;
+            }
+        }
+        path.push_str(name);
+        self.patterns.iter().any(|p| glob_match(p, path.as_bytes()))
+    }
+}
+
 /// Variable types whose VCD length is fixed at 64 bits (an f64 real).
 fn is_real_var(var_type: u8) -> bool {
     // real, real_parameter, realtime.
@@ -579,6 +680,7 @@ fn vcd(
     start_time: Option<u64>,
     end_time: Option<u64>,
     jobs: usize,
+    signals: &[String],
 ) -> std::io::Result<()> {
     if let (Some(start), Some(end)) = (start_time, end_time)
         && start > end
@@ -625,8 +727,9 @@ fn vcd(
 
     // Second pass over the hierarchy: write the VCD header and declarations,
     // and build the per-variable table indexed by variable id.
+    let filter = SignalFilter::new(signals);
     write_vcd_header(&mut out, &header)?;
-    let vars = write_vcd_declarations(&mut out, input, &lengths)?;
+    let vars = write_vcd_declarations(&mut out, input, &lengths, &filter)?;
     writeln!(out, "$enddefinitions $end")?;
 
     write_vcd_value_changes(&mut out, input, &lengths, &vars, &header, start, end, jobs)?;
@@ -654,18 +757,31 @@ fn write_vcd_header<W: Write>(out: &mut W, header: &HeaderBlock) -> std::io::Res
 /// Writes the `$scope`/`$var`/`$upscope` declarations, returning a map from
 /// variable id to its VCD metadata. Every declared variable (including
 /// aliases) gets a `$var` line sharing the aliased id's code.
+///
+/// When `filter` is non-empty, only variables it selects get a `$var` line, and
+/// an id with no selected `$var` line is left `None` so the value-change path
+/// renders nothing for it. The geometry length is still consumed for every
+/// canonical variable and the id table stays dense, so filtering never shifts
+/// the id-to-geometry mapping.
 fn write_vcd_declarations<W: Write>(
     out: &mut W,
     input: &Path,
     lengths: &[VariableLength],
+    filter: &SignalFilter,
 ) -> std::io::Result<Vec<Option<VcdVar>>> {
     // Indexed directly by (0-based) non-aliased variable id. Ids are dense, so
     // a Vec avoids a per-value-change hash lookup in the hot emit loop; any
     // gap stays `None`.
     let mut vars: Vec<Option<VcdVar>> = Vec::new();
+    // Whether any `$var` line of an id was selected by the filter, indexed by
+    // id. An id never selected is pruned from `vars` after the walk.
+    let mut kept: Vec<bool> = Vec::new();
     // The geometry lengths are indexed by non-aliased variable id - 1.
     let mut next_length = 0usize;
     let mut unnamed_scope = 0u32;
+    // Enclosing scope names, for matching a variable's full dotted path. Empty
+    // unless a filter is active, so the no-filter path pays nothing.
+    let mut scopes: Vec<String> = Vec::new();
 
     for_each_hierarchy_entry(input, |entry| {
         match entry {
@@ -683,8 +799,16 @@ fn write_vcd_declarations<W: Write>(
                 } else {
                     writeln!(out, "$scope {type_name} {name} $end")?;
                 }
+                if !filter.is_empty() {
+                    scopes.push(name);
+                }
             }
-            HierarchyEntry::UpScope => writeln!(out, "$upscope $end")?,
+            HierarchyEntry::UpScope => {
+                writeln!(out, "$upscope $end")?;
+                if !filter.is_empty() {
+                    scopes.pop();
+                }
+            }
             HierarchyEntry::Var {
                 var_type,
                 name,
@@ -694,6 +818,7 @@ fn write_vcd_declarations<W: Write>(
                 direction: _,
             } => {
                 let name = String::from_utf8_lossy(&name).into_owned();
+                let selected = filter.selects(&scopes, &name);
                 let type_name = var_type_name(var_type).unwrap_or("wire");
                 // The VCD identifier code is 1-based; fst-io ids are 0-based.
                 let code = vcd_id(id + 1);
@@ -708,7 +833,15 @@ fn write_vcd_declarations<W: Write>(
                 } else {
                     length
                 };
-                writeln!(out, "$var {type_name} {vcd_length} {code} {name} $end")?;
+                if selected {
+                    writeln!(out, "$var {type_name} {vcd_length} {code} {name} $end")?;
+                }
+
+                let idx = id as usize;
+                if idx >= kept.len() {
+                    kept.resize(idx + 1, false);
+                }
+                kept[idx] |= selected;
 
                 // A non-aliased variable consumes the next geometry length and
                 // becomes the id's canonical decode info. An alias reuses the
@@ -720,7 +853,6 @@ fn write_vcd_declarations<W: Write>(
                         .copied()
                         .ok_or_else(|| invalid_data("more variables than geometry lengths"))?;
                     next_length += 1;
-                    let idx = id as usize;
                     if idx >= vars.len() {
                         vars.resize_with(idx + 1, || None);
                     }
@@ -735,6 +867,17 @@ fn write_vcd_declarations<W: Write>(
         }
         Ok(())
     })?;
+
+    // Prune ids no `$var` line selected: the value-change path treats a `None`
+    // entry exactly like an undeclared variable and renders nothing for it, so
+    // the filter costs nothing in the decode hot loop.
+    if !filter.is_empty() {
+        for (idx, var) in vars.iter_mut().enumerate() {
+            if !kept.get(idx).copied().unwrap_or(false) {
+                *var = None;
+            }
+        }
+    }
 
     Ok(vars)
 }
@@ -1738,6 +1881,56 @@ fn dump(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glob_match_handles_stars_and_questions() {
+        assert!(glob_match(b"*", b"anything"));
+        assert!(glob_match(b"", b""));
+        assert!(!glob_match(b"", b"x"));
+        assert!(glob_match(b"a.b.c", b"a.b.c"));
+        assert!(!glob_match(b"a.b.c", b"a.b.d"));
+        assert!(glob_match(b"a.*.c", b"a.middle.c"));
+        assert!(glob_match(b"a.*", b"a.b.c.d"));
+        assert!(glob_match(b"a.b?d", b"a.bxd"));
+        assert!(!glob_match(b"a.b?d", b"a.bd"));
+        assert!(glob_match(b"*.clk", b"top.cpu.clk"));
+        assert!(!glob_match(b"*.clk", b"top.cpu.clock"));
+        // A `*` matches an empty run, and adjacent stars collapse.
+        assert!(glob_match(b"a**c", b"ac"));
+    }
+
+    #[test]
+    fn signal_filter_empty_selects_everything() {
+        let filter = SignalFilter::new(&[]);
+        assert!(filter.is_empty());
+        assert!(filter.selects(&["top".into(), "cpu".into()], "clk"));
+    }
+
+    #[test]
+    fn signal_filter_matches_full_path() {
+        let filter = SignalFilter::new(&["top.cpu.clk".to_string()]);
+        assert!(filter.selects(&["top".into(), "cpu".into()], "clk"));
+        assert!(!filter.selects(&["top".into(), "cpu".into()], "rst"));
+        assert!(!filter.selects(&["top".into()], "clk"));
+    }
+
+    #[test]
+    fn signal_filter_scope_prefix_selects_subtree() {
+        // A pattern matching a scope's dotted path selects every variable under
+        // it, at any depth.
+        let filter = SignalFilter::new(&["top.cpu".to_string()]);
+        assert!(filter.selects(&["top".into(), "cpu".into()], "clk"));
+        assert!(filter.selects(&["top".into(), "cpu".into(), "regs".into()], "pc"));
+        assert!(!filter.selects(&["top".into(), "mem".into()], "data"));
+    }
+
+    #[test]
+    fn signal_filter_glob_scope_prefix() {
+        let filter = SignalFilter::new(&["top.*".to_string()]);
+        assert!(filter.selects(&["top".into(), "cpu".into()], "clk"));
+        // `top.*` matches the `top.cpu` scope prefix, selecting its subtree.
+        assert!(filter.selects(&["top".into(), "cpu".into(), "alu".into()], "out"));
+    }
 
     #[test]
     fn vcd_id_is_base_94_from_one() {
