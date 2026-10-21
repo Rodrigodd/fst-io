@@ -510,7 +510,7 @@ fn c_string(bytes: &[u8]) -> String {
 
 /// Per-variable information needed to write value changes: the VCD identifier
 /// code, the bit length from the geometry block, and whether it is a port
-/// (which prefixes vectors with `p` instead of `b`).
+/// (which prefixes vectors with `p`).
 struct VcdVar {
     code: String,
     length: VariableLength,
@@ -528,7 +528,7 @@ fn format_real(bytes: [u8; 8], endianness: RealEndianess) -> String {
 }
 
 /// A minimal `%.*g` formatter: `precision` significant digits, shortest of
-/// fixed and scientific, trailing zeros trimmed. Dependency-free.
+/// fixed and scientific, trailing zeros trimmed.
 fn format_g(value: f64, precision: usize) -> String {
     if value == 0.0 {
         return "0".to_string();
@@ -561,8 +561,8 @@ fn trim_trailing_zeros(s: String) -> String {
     trimmed.trim_end_matches('.').to_string()
 }
 
-/// Trims trailing zeros from the mantissa of a Rust `{:e}` string, and drops a
-/// `+` is never emitted by Rust so only the mantissa needs fixing.
+/// Trims trailing zeros from the mantissa of a Rust `{:e}` string. Rust never
+/// emits a `+` in the exponent, so only the mantissa needs fixing.
 fn trim_mantissa_in_exp(s: &mut String) {
     if let Some(e) = s.find('e') {
         let (mantissa, exp) = s.split_at(e);
@@ -751,15 +751,14 @@ fn write_vcd_declarations<W: Write>(
 ///
 /// Only the decode is parallel; the output is still one serial, time-ordered
 /// stream. The number of blocks in flight (dispatched to the pool but not yet
-/// written) is bounded, which bounds memory regardless of file size -- the
-/// same streaming guarantee the serial version had.
+/// written) is bounded, which bounds memory regardless of file size.
 ///
 /// The prelude -- folding every block before the range, and the first in-range
 /// block's initial state, into the `$dumpvars` baseline -- stays on the main
 /// thread: it is inherently serial (a running fold toward `start`) and is
 /// written before any worker output. The `$dumpvars`/`#time` state machine
 /// likewise lives only on the writer thread, so the emitted framing mirrors the
-/// reference C library exactly, as in the serial path.
+/// reference C library exactly.
 #[allow(clippy::too_many_arguments)]
 fn write_vcd_value_changes<W: Write>(
     out: &mut W,
@@ -849,7 +848,7 @@ fn write_vcd_value_changes<W: Write>(
             }
         }
         if start > block.start_time {
-            // Changes before `start` advance the baseline rather than emit.
+            // Changes before `start` advance the baseline.
             let tail = block.read_tail_layout()?;
             let positions = block.read_positions(&head, &tail)?;
             let times = block.read_time_table(&tail)?;
@@ -1122,7 +1121,8 @@ fn write_vcd_value_changes<W: Write>(
         result
     });
 
-    // dropping the buffers is surprisingly slow
+    // Freeing every recycled buffer here would run the whole deallocation on
+    // the way out; leak the pool instead and let the process reclaim it.
     std::mem::forget(pool);
 
     result
@@ -1185,10 +1185,9 @@ fn decode_block_changes(
     let times = block.read_time_table(&tail)?;
 
     // The time table is strictly increasing, so the in-range window
-    // `[start, end]` maps to a contiguous `time_index` range `[lo, hi)` found
-    // once by binary search. Filtering each change against these integer
-    // bounds avoids a random-access gather into `times` per change — the
-    // collect loop's single hottest instruction before this change.
+    // `[start, end]` maps to a contiguous `time_index` range `[lo, hi)`, found
+    // once by binary search. Each change is then filtered by an integer
+    // compare on its index, without a per-change lookup into `times`.
     let lo = times.partition_point(|&t| t < start) as u64;
     let hi = times.partition_point(|&t| t <= end) as u64; // exclusive upper bound
     let table_len = times.len() as u64;
@@ -1198,15 +1197,12 @@ fn decode_block_changes(
     // its full VCD line (value + code + '\n'). Each variable's run is already
     // time-ordered; the runs are concatenated here and ordered globally below.
     for (geometry_index, &id) in ids.iter().enumerate() {
-        // The identifier/port info for this variable, resolved once per run
-        // (not per change). A variable with no entry emits no value text, but
-        // its changes are still kept so the writer sees their `#time`.
+        // A variable with no entry emits no value text, but its changes are
+        // still kept so the writer sees their `#time`.
         let var = vars.get(id as usize).and_then(Option::as_ref);
         let waves = block.read_waves(&head, &positions, id, lengths[geometry_index])?;
         for change in waves.iter() {
             let (time_index, value) = change?;
-            // Preserve the original hard error for an index past the table
-            // (malformed input), rather than silently dropping it.
             if time_index >= table_len {
                 return Err(invalid_data("time index out of range"));
             }
@@ -1224,15 +1220,12 @@ fn decode_block_changes(
         }
     }
 
-    // Stable counting sort by `time_index` (dense, bounded by the time table),
-    // which replaces an O(n log n) comparison sort with O(n + T) work. The
-    // runs are concatenated in variable order, so a stable sort preserves the
+    // Stable counting sort by `time_index` (dense, bounded by the time table).
+    // The runs are concatenated in variable order, so stability preserves the
     // per-variable order within each time step, matching the reference.
     let n = changes.len();
     let bucket_count = times.len();
-    // Per-bucket start offsets via a prefix sum of the counts. The buffer is
-    // recycled: cleared then zero-filled to the current bucket count, so no
-    // fresh allocation + page-zeroing happens per block.
+    // Per-bucket start offsets via a prefix sum of the counts.
     offsets.clear();
     offsets.resize(bucket_count + 1, 0u32);
     for &(time_index, _, _) in &changes {
@@ -1241,14 +1234,11 @@ fn decode_block_changes(
     for i in 0..bucket_count {
         offsets[i + 1] += offsets[i];
     }
-    // Scatter the per-change rendered ranges into time-sorted order, then
-    // build the block's final layout: all of a block's rendered change bytes
-    // copied CONTIGUOUSLY into `framed` in sorted order, and one `Change`
-    // entry `(time, frame_start, frame_len)` PER DISTINCT TIME (a time-group
-    // span), not per change. This does the heavy byte copy on the parallel
-    // decode thread and shrinks the serial writer's loop from per-change to
-    // per-time-group, each emitted with a single `write_all` of a contiguous
-    // span. `scratch` holds the sorted `(time, rstart, rlen)` temporarily.
+    // Scatter the per-change rendered ranges into time-sorted order in
+    // `scratch`, then lay the bytes out contiguously in `framed` in that order
+    // and record one `Change` per distinct time (a time-group span), so the
+    // writer emits one `#time` and one span per entry. `scratch` holds the
+    // sorted `(time, rstart, rlen)` temporarily.
     scratch.clear();
     scratch.resize_with(n, || (0, 0, 0));
     for &(time_index, rstart, rlen) in &changes {
@@ -1333,53 +1323,32 @@ fn rebuffer(
     }
 }
 
-/// A counting semaphore built on the standard library only (fst-tool takes no
-/// threading dependency). `acquire` blocks until a permit is free or the
-/// semaphore is shut down; `release` returns a permit and wakes a waiter.
-///
-/// `shutdown` exists for the error path: if the writer stops early, the
-/// dispatcher could otherwise block forever in `acquire` (no permits are ever
-/// released again), which would hang the scope that joins every thread.
-/// Shutting down makes every current and future `acquire` return immediately.
 /// One TIME-GROUP span, time-sorted within a block: `(time, start, len)` where
 /// `[start, start+len)` is the concatenated, pre-rendered VCD output of every
-/// change at `time`, laid out contiguously in the block's `framed` buffer by
-/// the parallel decoder. The serial writer emits one `#time` line per entry
-/// and one `write_all` of the span — so its loop runs per distinct time, not
-/// per change, and the byte copy already happened off the critical path.
+/// change at `time`, laid out contiguously in the block's `framed` buffer.
 ///
 /// During the counting sort the first field transiently holds the `time_index`
-/// and the span fields hold the per-change `payloads` range — see
-/// `decode_block_changes`.
+/// and the span fields hold the per-change `payloads` range.
 type Change = (u64, u32, u32);
 
-/// The two reusable buffers that circulate with one in-flight block: the raw
-/// section bytes a worker decodes, and the change list it produces. Bundling
-/// them means one pool slot bounds in-flight blocks and recycles both
-/// allocations.
+/// The reusable buffers that circulate with one in-flight block. Bundling them
+/// means one pool slot bounds in-flight blocks and recycles every allocation.
 #[derive(Default)]
 struct Buffers {
     /// Backing bytes for the buffered section handed to a worker.
     bytes: Vec<u8>,
     /// The decoded, time-sorted change list handed to the writer.
     changes: Vec<Change>,
-    /// Scratch scatter target for the counting sort, recycled alongside the
-    /// rest so the sort allocates nothing per block.
+    /// Scratch scatter target for the counting sort.
     scratch: Vec<Change>,
-    /// Per-block payload arena: the concatenated bytes of every vector/varlen
-    /// change in the block. `RenderedValue` records ranges into this instead
-    /// of owning a `Vec` per change, so decoding a block appends to one
-    /// growable buffer (reused across blocks) rather than doing one heap
-    /// allocation per change — and clearing a block frees nothing.
+    /// Per-block arena holding the concatenated bytes of every rendered change;
+    /// each change records a `[start, len)` range into it.
     payloads: Vec<u8>,
-    /// Counting-sort bucket offsets (one per time-table entry + 1), recycled
-    /// so the sort does not allocate + zero a fresh `Vec` per block — that
-    /// per-block allocation showed up as kernel page-zeroing in the profile.
+    /// Counting-sort bucket offsets (one per time-table entry + 1).
     offsets: Vec<u32>,
-    /// The block's rendered change bytes laid out CONTIGUOUSLY in time-sorted
-    /// order. The writer copies time-group spans straight out of here, so the
-    /// heavy sorted copy happens on the parallel decode thread, not the serial
-    /// writer. `changes` indexes into this (not `payloads`).
+    /// The block's rendered change bytes laid out contiguously in time-sorted
+    /// order; the writer copies time-group spans straight out of here.
+    /// `changes` indexes into this, not `payloads`.
     framed: Vec<u8>,
 }
 
@@ -1495,7 +1464,7 @@ fn emit_block_changes<W: Write>(
 }
 
 /// Two-digit ASCII pairs "00".."99", for formatting two decimal digits per
-/// division instead of one. Built at compile time.
+/// division.
 static DEC_PAIRS: [[u8; 2]; 100] = {
     let mut t = [[0u8; 2]; 100];
     let mut i = 0usize;
@@ -1506,10 +1475,9 @@ static DEC_PAIRS: [[u8; 2]; 100] = {
     t
 };
 
-/// Appends `value`'s base-10 ASCII digits to `buf`. Formats two digits per
-/// iteration via [`DEC_PAIRS`], halving the `div`/`rem` chain — the writer's
-/// dominant cost is formatting the large `#time` timestamps. The largest
-/// `u64` is 20 digits, so a 20-byte scratch buffer always suffices.
+/// Appends `value`'s base-10 ASCII digits to `buf`, two digits per iteration
+/// via [`DEC_PAIRS`]. The largest `u64` is 20 digits, so a 20-byte scratch
+/// buffer always suffices.
 fn push_u64(buf: &mut Vec<u8>, mut value: u64) {
     let mut tmp = [0u8; 20];
     let mut i = tmp.len();
@@ -1534,8 +1502,7 @@ fn push_u64(buf: &mut Vec<u8>, mut value: u64) {
 }
 
 /// Maps each byte to its 8 bits as ASCII `'0'`/`'1'`, most-significant bit
-/// first. Used to expand packed multi-bit values a whole byte at a time.
-/// Built at compile time, so it costs nothing at runtime.
+/// first, to expand packed multi-bit values a whole byte at a time.
 static BIT_EXPAND: [[u8; 8]; 256] = {
     let mut table = [[0u8; 8]; 256];
     let mut byte = 0usize;
@@ -1552,12 +1519,6 @@ static BIT_EXPAND: [[u8; 8]; 256] = {
 
 /// Renders one value change as its complete VCD line — value, identifier
 /// `code`, and trailing `\n` — appended to the payload arena `out`.
-///
-/// This runs on the parallel decode threads (not the serial writer), so all
-/// the per-change work — the match on value kind, packed-bit expansion, real
-/// formatting, and copying the identifier code — is off the writer's critical
-/// path. The writer then only emits `#time` markers and bulk-copies the
-/// already-rendered byte range.
 fn render_change(out: &mut Vec<u8>, value: &Value, var: &VcdVar, real_endianness: RealEndianess) {
     match value {
         Value::Bit(bit) => {
@@ -1575,10 +1536,8 @@ fn render_change(out: &mut Vec<u8>, value: &Value, var: &VcdVar, real_endianness
         }
         Value::Packed { data, bits } => {
             out.push(if var.is_port { b'p' } else { b'b' });
-            // Expand packed bits (MSB-first) to one ASCII '0'/'1' per bit. A
-            // 256-entry lookup table turns each whole input byte into its 8
-            // ASCII chars with a single table load + 8-byte copy, instead of a
-            // per-bit shift with two divisions (`i/8`, `i%8`).
+            // Expand packed bits (MSB-first) to one ASCII '0'/'1' per bit; the
+            // table turns each whole input byte into its 8 ASCII chars.
             let bits = *bits;
             let full = bits / 8;
             out.reserve(bits + 1);
@@ -1819,8 +1778,7 @@ mod tests {
     #[test]
     fn buffer_pool_recycles_allocation() {
         // A bundle returned to the pool comes back out with its capacity
-        // intact, so the next fill reuses the same allocation instead of
-        // allocating a fresh one.
+        // intact, so the next fill reuses the same allocation.
         let pool = BufferPool::new(1);
         let mut bundle = pool.take().unwrap();
         bundle.bytes.extend_from_slice(&[0u8; 1024]);

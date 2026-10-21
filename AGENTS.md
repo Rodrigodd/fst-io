@@ -87,6 +87,11 @@ built binary at `target/release/fst-tool`.
 - A comment must describe the current state of the code as it is. Never write a
   comment that explains a change, compares to a previous version, or narrates
   how the code used to work ("now we…", "changed to…", "previously this…").
+- State what the code does, not what it does not do. Avoid the "X rather than Y"
+  form — mentioning the alternative Y adds nothing; just say X.
+- Do not restate what the code already makes clear. A `const` in a `static`
+  block needs no "built at compile time" note, and a `return Err(...)` on an
+  obvious guard needs no comment explaining the error condition.
 - Keep comments brief and to the point. Delete commented-out code rather than
   leaving it behind.
 
