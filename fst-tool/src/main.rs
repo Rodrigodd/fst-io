@@ -566,6 +566,63 @@ fn vcd_id(mut id: u64) -> String {
     code
 }
 
+/// The digit alphabet for minimal filtered codes, in the required allocation
+/// order: lowercase, uppercase, digits, then the remaining printable-ASCII VCD
+/// identifier characters (the "special" group, in ASCII order). All 94 legal
+/// identifier characters appear exactly once.
+static MINIMAL_ALPHABET: [u8; 94] = {
+    let mut alphabet = [0u8; 94];
+    let mut i = 0usize;
+    let mut c = b'a';
+    while c <= b'z' {
+        alphabet[i] = c;
+        i += 1;
+        c += 1;
+    }
+    c = b'A';
+    while c <= b'Z' {
+        alphabet[i] = c;
+        i += 1;
+        c += 1;
+    }
+    c = b'0';
+    while c <= b'9' {
+        alphabet[i] = c;
+        i += 1;
+        c += 1;
+    }
+    // The remaining printable ASCII (0x21..=0x7e) that is not alphanumeric.
+    c = b'!';
+    while c <= b'~' {
+        let is_alnum = c.is_ascii_lowercase() || c.is_ascii_uppercase() || c.is_ascii_digit();
+        if !is_alnum {
+            alphabet[i] = c;
+            i += 1;
+        }
+        c += 1;
+    }
+    alphabet
+};
+
+/// Encodes a 1-based ordinal as a minimal VCD identifier code over
+/// [`MINIMAL_ALPHABET`], used when `--signal` renumbers the kept signals. This
+/// is bijective base-94 written most-significant digit first, so codes grow in
+/// lexical order over the alphabet: `a`, `b`, ... then `aa`, `ab`, ... (not
+/// `aa`, `ba`). The ordinal is 1-based (0 is illegal).
+fn minimal_vcd_id(mut n: u64) -> String {
+    const BASE: u64 = 94;
+    let mut digits = Vec::new();
+    while n != 0 {
+        n -= 1;
+        digits.push(MINIMAL_ALPHABET[(n % BASE) as usize]);
+        n /= BASE;
+    }
+    // `digits` holds least-significant first; reverse for MSD-first so the
+    // output orders lexically.
+    digits.reverse();
+    String::from_utf8(digits).expect("alphabet is ASCII")
+}
+
 /// Renders the FST `timescale` exponent as a VCD time unit, e.g. `1ns` or
 /// `100ps`. Matches the mapping in the reference C library.
 fn timescale_label(timescale: i8) -> String {
@@ -891,7 +948,7 @@ fn write_vcd_declarations<W: Write>(
                         next_code += 1;
                         n
                     });
-                    vcd_id(number)
+                    minimal_vcd_id(number)
                 } else {
                     // Not emitted; the value is unused.
                     String::new()
@@ -958,7 +1015,7 @@ fn write_vcd_declarations<W: Write>(
             match minimal_codes.get(&(idx as u64)) {
                 Some(&number) => {
                     if let Some(var) = var {
-                        var.code = vcd_id(number);
+                        var.code = minimal_vcd_id(number);
                     }
                 }
                 None => *var = None,
@@ -2036,6 +2093,34 @@ mod tests {
         assert_eq!(vcd_id(94), "~");
         assert_eq!(vcd_id(95), "!!");
         assert_eq!(vcd_id(96), "\"!");
+    }
+
+    #[test]
+    fn minimal_vcd_id_orders_alphabet_then_lexically() {
+        // Allocation order: lowercase, uppercase, digits, then special.
+        assert_eq!(minimal_vcd_id(1), "a");
+        assert_eq!(minimal_vcd_id(26), "z");
+        assert_eq!(minimal_vcd_id(27), "A");
+        assert_eq!(minimal_vcd_id(52), "Z");
+        assert_eq!(minimal_vcd_id(53), "0");
+        assert_eq!(minimal_vcd_id(62), "9");
+        assert_eq!(minimal_vcd_id(63), "!");
+        assert_eq!(minimal_vcd_id(94), "~");
+        // Bijective base 94, most-significant digit first: the first two-char
+        // code is `aa`, and incrementing changes the last digit (`aa`, `ab`),
+        // not the first (`aa`, `ba`).
+        assert_eq!(minimal_vcd_id(95), "aa");
+        assert_eq!(minimal_vcd_id(96), "ab");
+    }
+
+    #[test]
+    fn minimal_alphabet_covers_every_legal_code_once() {
+        let mut seen = std::collections::HashSet::new();
+        for &c in &MINIMAL_ALPHABET {
+            assert!((b'!'..=b'~').contains(&c), "code {c} outside VCD range");
+            assert!(seen.insert(c), "duplicate code {c}");
+        }
+        assert_eq!(seen.len(), 94);
     }
 
     #[test]
