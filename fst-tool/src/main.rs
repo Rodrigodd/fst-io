@@ -960,6 +960,8 @@ fn write_vcd_value_changes<W: Write>(
                             job.payloads,
                             ids,
                             lengths,
+                            vars,
+                            real_endianness,
                             start,
                             end,
                         );
@@ -1064,8 +1066,6 @@ fn write_vcd_value_changes<W: Write>(
                         out,
                         &decoded.changes,
                         &decoded.payloads,
-                        vars,
-                        real_endianness,
                         &mut dumpvars_state,
                         &mut current_time,
                     )?;
@@ -1139,6 +1139,8 @@ fn decode_block_changes(
     mut payloads: Vec<u8>,
     ids: &[u64],
     lengths: &[VariableLength],
+    vars: &[Option<VcdVar>],
+    real_endianness: RealEndianess,
     start: u64,
     end: u64,
 ) -> std::io::Result<Decoded> {
@@ -1161,8 +1163,12 @@ fn decode_block_changes(
     let hi = times.partition_point(|&t| t <= end);
 
     // Collect in-range changes keyed by `time_index` (field 0 holds the index,
-    // not the resolved time yet). Each variable's run is already time-ordered;
-    // the runs are concatenated here and ordered globally below.
+    // not the resolved time yet). The complete VCD line is rendered here, on
+    // the decode thread, into the payload arena; the change records only its
+    // `[start, len)` range. A change on an undeclared variable renders no bytes
+    // (`len == 0`) but is still recorded, so the writer still emits its `#time`.
+    // Each variable's run is already time-ordered; the runs are concatenated
+    // here and ordered globally below.
     for (geometry_index, &id) in ids.iter().enumerate() {
         let waves = block.read_waves(&head, &positions, id, lengths[geometry_index])?;
         for change in waves.iter() {
@@ -1178,11 +1184,12 @@ fn decode_block_changes(
             if (time_index as usize) < lo || time_index as usize >= hi {
                 continue;
             }
-            changes.push((
-                time_index,
-                id,
-                RenderedValue::from_value(&value, &mut payloads),
-            ));
+            let payload_start = payloads.len() as u32;
+            if let Some(Some(var)) = vars.get(id as usize) {
+                render_change(&mut payloads, &value, var, real_endianness);
+            }
+            let payload_len = payloads.len() as u32 - payload_start;
+            changes.push((time_index, payload_start, payload_len));
         }
     }
 
@@ -1201,13 +1208,13 @@ fn decode_block_changes(
         offsets[i + 1] += offsets[i];
     }
     // Scatter into `scratch`, resolving each `time_index` to its real time.
-    // Slots are pre-filled with a zero-cost placeholder (`Bit` owns nothing),
-    // then overwritten in sorted position.
+    // Slots are pre-filled then overwritten in sorted position; the tuples are
+    // trivially copyable, so this is a plain memory move.
     scratch.clear();
-    scratch.resize_with(n, || (0, 0, RenderedValue::Bit(b'x')));
-    for (time_index, id, value) in changes.drain(..) {
+    scratch.resize_with(n, || (0, 0, 0));
+    for &(time_index, payload_start, payload_len) in &changes {
         let slot = &mut offsets[time_index as usize];
-        scratch[*slot as usize] = (times[time_index as usize], id, value);
+        scratch[*slot as usize] = (times[time_index as usize], payload_start, payload_len);
         *slot += 1;
     }
     // `scratch` now holds the sorted, time-resolved changes; swap so `changes`
@@ -1279,7 +1286,11 @@ fn rebuffer(
 /// released again), which would hang the scope that joins every thread.
 /// Shutting down makes every current and future `acquire` return immediately.
 /// One value change: `(time, id, value)`, time-sorted within a block.
-type Change = (u64, u64, RenderedValue);
+/// One value change, time-sorted within a block: the resolved `time` plus the
+/// `[start, len)` byte range of its COMPLETE pre-rendered VCD line (value +
+/// code + `\n`) in the block's payload arena. The line is rendered on the
+/// decode thread, so the writer only frames `#time` and copies the range.
+type Change = (u64, u32, u32);
 
 /// The two reusable buffers that circulate with one in-flight block: the raw
 /// section bytes a worker decodes, and the change list it produces. Bundling
@@ -1389,15 +1400,13 @@ fn write_u64<W: Write>(out: &mut W, mut value: u64) -> std::io::Result<()> {
 /// stream reads as one time-ordered dump.
 fn emit_block_changes<W: Write>(
     out: &mut W,
-    changes: &[(u64, u64, RenderedValue)],
+    changes: &[Change],
     payloads: &[u8],
-    vars: &[Option<VcdVar>],
-    real_endianness: RealEndianess,
     dumpvars_state: &mut u8,
     current_time: &mut Option<u64>,
 ) -> std::io::Result<()> {
-    for (time, id, value) in changes {
-        if *current_time != Some(*time) {
+    for &(time, start, len) in changes {
+        if *current_time != Some(time) {
             // The reference opens `$dumpvars` at the first dumped time and
             // closes it at the second; on the frame path the state starts
             // closed so neither happens here.
@@ -1406,17 +1415,18 @@ fn emit_block_changes<W: Write>(
                 *dumpvars_state = 2;
             }
             out.write_all(b"#")?;
-            write_u64(out, *time)?;
+            write_u64(out, time)?;
             out.write_all(b"\n")?;
             if *dumpvars_state == 0 {
                 out.write_all(b"$dumpvars\n")?;
                 *dumpvars_state = 1;
             }
-            *current_time = Some(*time);
+            *current_time = Some(time);
         }
-        if let Some(Some(var)) = vars.get(*id as usize) {
-            value.write(out, payloads, var, real_endianness)?;
-        }
+        // The change's complete VCD line was rendered on the decode thread; a
+        // change on an undeclared variable has a zero-length range and emits
+        // nothing but still advanced `#time` above.
+        out.write_all(&payloads[start as usize..(start + len) as usize])?;
     }
     Ok(())
 }
@@ -1438,104 +1448,56 @@ static BIT_EXPAND: [[u8; 8]; 256] = {
     table
 };
 
-/// A value change decoupled from the block's borrowed buffers. This is a
-/// `Copy`, `Drop`-free descriptor: the variable-length payloads (`VarLen`,
-/// `Vector`) live in a reused arena (`payloads`) and are referenced by a
-/// `[start, len)` byte range, so moving/discarding a descriptor costs nothing
-/// and clearing a block's change list frees no per-change allocation.
-#[derive(Clone, Copy)]
-enum RenderedValue {
-    Bit(u8),
-    Real([u8; 8]),
-    VarLen { start: u32, len: u32 },
-    Vector { start: u32, len: u32 },
-}
-
-impl RenderedValue {
-    /// Renders `value` into a descriptor, appending any variable-length bytes
-    /// to the shared `payloads` arena. The arena is append-only and never
-    /// reordered, so the recorded range stays valid until the arena is cleared
-    /// for the next block.
-    fn from_value(value: &Value, payloads: &mut Vec<u8>) -> Self {
-        match value {
-            Value::Bit(bit) => RenderedValue::Bit(*bit),
-            Value::Real(bytes) => RenderedValue::Real(*bytes),
-            Value::VarLen(data) => {
-                let start = payloads.len() as u32;
-                payloads.extend_from_slice(data);
-                RenderedValue::VarLen {
-                    start,
-                    len: data.len() as u32,
-                }
+/// Renders one value change as its complete VCD line — value, identifier
+/// `code`, and trailing `\n` — appended to the payload arena `out`.
+///
+/// This runs on the parallel decode threads (not the serial writer), so all
+/// the per-change work — the match on value kind, packed-bit expansion, real
+/// formatting, and copying the identifier code — is off the writer's critical
+/// path. The writer then only emits `#time` markers and bulk-copies the
+/// already-rendered byte range.
+fn render_change(out: &mut Vec<u8>, value: &Value, var: &VcdVar, real_endianness: RealEndianess) {
+    match value {
+        Value::Bit(bit) => {
+            out.push(*bit);
+        }
+        Value::Real(bytes) => {
+            out.push(b'r');
+            out.extend_from_slice(format_real(*bytes, real_endianness).as_bytes());
+            out.push(b' ');
+        }
+        Value::VarLen(data) => {
+            out.push(b's');
+            out.extend_from_slice(data);
+            out.push(b' ');
+        }
+        Value::Packed { data, bits } => {
+            out.push(if var.is_port { b'p' } else { b'b' });
+            // Expand packed bits (MSB-first) to one ASCII '0'/'1' per bit. A
+            // 256-entry lookup table turns each whole input byte into its 8
+            // ASCII chars with a single table load + 8-byte copy, instead of a
+            // per-bit shift with two divisions (`i/8`, `i%8`).
+            let bits = *bits;
+            let full = bits / 8;
+            out.reserve(bits + 1);
+            for &byte in &data[..full] {
+                out.extend_from_slice(&BIT_EXPAND[byte as usize]);
             }
-            Value::Packed { data, bits } => {
-                let start = payloads.len() as u32;
-                // Expand packed bits (MSB-first) to one ASCII '0'/'1' per bit,
-                // straight into the arena. The 256-entry table turns each whole
-                // input byte into its 8 ASCII chars with one table load + copy,
-                // instead of a per-bit shift with two divisions (`i/8`, `i%8`).
-                let bits = *bits;
-                let full = bits / 8;
-                payloads.reserve(bits);
-                for &byte in &data[..full] {
-                    payloads.extend_from_slice(&BIT_EXPAND[byte as usize]);
-                }
-                let rem = bits % 8;
-                if rem != 0 {
-                    payloads.extend_from_slice(&BIT_EXPAND[data[full] as usize][..rem]);
-                }
-                RenderedValue::Vector {
-                    start,
-                    len: bits as u32,
-                }
+            // Trailing partial byte: emit only its top `rem` bits.
+            let rem = bits % 8;
+            if rem != 0 {
+                out.extend_from_slice(&BIT_EXPAND[data[full] as usize][..rem]);
             }
-            Value::Ascii(data) => {
-                let start = payloads.len() as u32;
-                payloads.extend_from_slice(data);
-                RenderedValue::Vector {
-                    start,
-                    len: data.len() as u32,
-                }
-            }
+            out.push(b' ');
+        }
+        Value::Ascii(data) => {
+            out.push(if var.is_port { b'p' } else { b'b' });
+            out.extend_from_slice(data);
+            out.push(b' ');
         }
     }
-
-    fn write<W: Write>(
-        &self,
-        out: &mut W,
-        payloads: &[u8],
-        var: &VcdVar,
-        real_endianness: RealEndianess,
-    ) -> std::io::Result<()> {
-        match self {
-            RenderedValue::Bit(bit) => {
-                out.write_all(&[*bit])?;
-                out.write_all(var.code.as_bytes())?;
-                out.write_all(b"\n")
-            }
-            RenderedValue::Real(bytes) => {
-                out.write_all(b"r")?;
-                out.write_all(format_real(*bytes, real_endianness).as_bytes())?;
-                out.write_all(b" ")?;
-                out.write_all(var.code.as_bytes())?;
-                out.write_all(b"\n")
-            }
-            RenderedValue::VarLen { start, len } => {
-                out.write_all(b"s")?;
-                out.write_all(&payloads[*start as usize..(*start + *len) as usize])?;
-                out.write_all(b" ")?;
-                out.write_all(var.code.as_bytes())?;
-                out.write_all(b"\n")
-            }
-            RenderedValue::Vector { start, len } => {
-                out.write_all(if var.is_port { b"p" } else { b"b" })?;
-                out.write_all(&payloads[*start as usize..(*start + *len) as usize])?;
-                out.write_all(b" ")?;
-                out.write_all(var.code.as_bytes())?;
-                out.write_all(b"\n")
-            }
-        }
-    }
+    out.extend_from_slice(var.code.as_bytes());
+    out.push(b'\n');
 }
 
 /// Records a variable's initial-state value into the running baseline maps.
