@@ -956,6 +956,7 @@ fn write_vcd_value_changes<W: Write>(
                             job.seq,
                             job.section,
                             job.changes,
+                            job.scratch,
                             ids,
                             lengths,
                             start,
@@ -981,18 +982,22 @@ fn write_vcd_value_changes<W: Write>(
             .name("vcd-dispatch".to_string())
             .spawn_scoped(scope, move || {
                 let mut seq = 0u64;
-                // Sends a job carrying a recycled changes buffer. Returns false
-                // if the pool was shut down, meaning stop.
-                let mut dispatch =
-                    |section: Section<std::io::Cursor<Vec<u8>>>, changes: Vec<Change>| -> bool {
-                        let _ = work_tx.send(Job {
-                            seq,
-                            section,
-                            changes,
-                        });
-                        seq += 1;
-                        true
-                    };
+                // Sends a job carrying the recycled changes and scratch
+                // buffers. Returns false if the pool was shut down, meaning
+                // stop.
+                let mut dispatch = |section: Section<std::io::Cursor<Vec<u8>>>,
+                                    changes: Vec<Change>,
+                                    scratch: Vec<Change>|
+                 -> bool {
+                    let _ = work_tx.send(Job {
+                        seq,
+                        section,
+                        changes,
+                        scratch,
+                    });
+                    seq += 1;
+                    true
+                };
 
                 let run = || -> std::io::Result<()> {
                     // The first block was already buffered by the prelude; take
@@ -1001,7 +1006,7 @@ fn write_vcd_value_changes<W: Write>(
                     let Some(bundle) = pool.take() else {
                         return Ok(());
                     };
-                    if !dispatch(first_block, bundle.changes) {
+                    if !dispatch(first_block, bundle.changes, bundle.scratch) {
                         return Ok(());
                     }
                     while let Some(section) = iterator.next()? {
@@ -1017,7 +1022,7 @@ fn write_vcd_value_changes<W: Write>(
                         if value_change_start_time(&section)? > end {
                             break;
                         }
-                        if !dispatch(section, bundle.changes) {
+                        if !dispatch(section, bundle.changes, bundle.scratch) {
                             break;
                         }
                     }
@@ -1066,6 +1071,7 @@ fn write_vcd_value_changes<W: Write>(
                     pool.give(Buffers {
                         bytes: decoded.bytes,
                         changes: decoded.changes,
+                        scratch: decoded.scratch,
                     });
                 }
             }
@@ -1099,6 +1105,7 @@ struct Job {
     seq: u64,
     section: Section<std::io::Cursor<Vec<u8>>>,
     changes: Vec<Change>,
+    scratch: Vec<Change>,
 }
 
 /// A worker's decoded output: the block's in-range changes, time-sorted, plus
@@ -1108,6 +1115,7 @@ struct Decoded {
     seq: u64,
     changes: Vec<Change>,
     bytes: Vec<u8>,
+    scratch: Vec<Change>,
 }
 
 /// Decodes one in-range block into its time-sorted change list. This is the
@@ -1115,10 +1123,12 @@ struct Decoded {
 /// buffered block plus the shared read-only metadata. The `changes` buffer is
 /// reused (cleared first); the section's backing bytes are recovered and
 /// returned for recycling.
+#[allow(clippy::too_many_arguments)]
 fn decode_block_changes(
     seq: u64,
     section: Section<std::io::Cursor<Vec<u8>>>,
     mut changes: Vec<Change>,
+    mut scratch: Vec<Change>,
     ids: &[u64],
     lengths: &[VariableLength],
     start: u64,
@@ -1131,6 +1141,9 @@ fn decode_block_changes(
     let positions = block.read_positions(&head, &tail)?;
     let times = block.read_time_table(&tail)?;
 
+    // Collect in-range changes keyed by `time_index` (field 0 holds the index,
+    // not the resolved time yet). Each variable's run is already time-ordered;
+    // the runs are concatenated here and ordered globally below.
     for (geometry_index, &id) in ids.iter().enumerate() {
         let waves = block.read_waves(&head, &positions, id, lengths[geometry_index])?;
         for change in waves.iter() {
@@ -1144,17 +1157,45 @@ fn decode_block_changes(
             if time < start || time > end {
                 continue;
             }
-            changes.push((time, id, RenderedValue::from_value(&value)));
+            changes.push((time_index, id, RenderedValue::from_value(&value)));
         }
     }
-    // Stable sort by time keeps per-variable order within a time step.
-    changes.sort_by_key(|&(time, _, _)| time);
+
+    // Stable counting sort by `time_index` (dense, bounded by the time table),
+    // which replaces an O(n log n) comparison sort with O(n + T) work. The
+    // runs are concatenated in variable order, so a stable sort preserves the
+    // per-variable order within each time step, matching the reference.
+    let n = changes.len();
+    let bucket_count = times.len();
+    // Per-bucket start offsets via a prefix sum of the counts.
+    let mut offsets = vec![0u32; bucket_count + 1];
+    for &(time_index, _, _) in &changes {
+        offsets[time_index as usize + 1] += 1;
+    }
+    for i in 0..bucket_count {
+        offsets[i + 1] += offsets[i];
+    }
+    // Scatter into `scratch`, resolving each `time_index` to its real time.
+    // Slots are pre-filled with a zero-cost placeholder (`Bit` owns nothing),
+    // then overwritten in sorted position.
+    scratch.clear();
+    scratch.resize_with(n, || (0, 0, RenderedValue::Bit(b'x')));
+    for (time_index, id, value) in changes.drain(..) {
+        let slot = &mut offsets[time_index as usize];
+        scratch[*slot as usize] = (times[time_index as usize], id, value);
+        *slot += 1;
+    }
+    // `scratch` now holds the sorted, time-resolved changes; swap so `changes`
+    // carries them out and the emptied buffer returns to the pool as scratch.
+    std::mem::swap(&mut changes, &mut scratch);
+
     // Recover the section's backing bytes so the writer can recycle them.
     let bytes = block.data.into_inner();
     Ok(Decoded {
         seq,
         changes,
         bytes,
+        scratch,
     })
 }
 
@@ -1224,6 +1265,9 @@ struct Buffers {
     bytes: Vec<u8>,
     /// The decoded, time-sorted change list handed to the writer.
     changes: Vec<Change>,
+    /// Scratch scatter target for the counting sort, recycled alongside the
+    /// rest so the sort allocates nothing per block.
+    scratch: Vec<Change>,
 }
 
 /// A bounded pool of reusable [`Buffers`], built on the standard library only
