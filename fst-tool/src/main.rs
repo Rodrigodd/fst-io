@@ -1055,6 +1055,9 @@ fn write_vcd_value_changes<W: Write>(
             std::collections::BTreeMap::new();
         let mut dumpvars_state = initial_dumpvars_state;
         let mut current_time = initial_time;
+        // Reused across blocks: the writer composes each block into this buffer
+        // and flushes it in one `write_all`.
+        let mut line: Vec<u8> = Vec::new();
 
         let mut write_loop = || -> std::io::Result<()> {
             while let Ok(result) = result_rx.recv() {
@@ -1066,6 +1069,7 @@ fn write_vcd_value_changes<W: Write>(
                         out,
                         &decoded.changes,
                         &decoded.payloads,
+                        &mut line,
                         &mut dumpvars_state,
                         &mut current_time,
                     )?;
@@ -1378,10 +1382,10 @@ impl BufferPool {
     }
 }
 
-/// Writes a `u64` as decimal ASCII directly to `out`, without the `std::fmt`
+/// Appends a `u64` as decimal ASCII to `out`, without the `std::fmt`
 /// machinery. The largest `u64` is 20 digits, so a 20-byte scratch buffer
 /// always suffices.
-fn write_u64<W: Write>(out: &mut W, mut value: u64) -> std::io::Result<()> {
+fn push_u64(out: &mut Vec<u8>, mut value: u64) {
     let mut buf = [0u8; 20];
     let mut i = buf.len();
     loop {
@@ -1392,33 +1396,39 @@ fn write_u64<W: Write>(out: &mut W, mut value: u64) -> std::io::Result<()> {
             break;
         }
     }
-    out.write_all(&buf[i..])
+    out.extend_from_slice(&buf[i..]);
 }
 
 /// Emits one block's already-sorted changes, carrying the `$dumpvars` state
 /// machine and the last-written `#time` across block boundaries so the whole
 /// stream reads as one time-ordered dump.
+///
+/// The block is composed into the reusable `line` buffer (framing + the
+/// pre-rendered change bytes) and flushed in a single `write_all`, instead of
+/// one write per change and per `#time` marker.
 fn emit_block_changes<W: Write>(
     out: &mut W,
     changes: &[Change],
     payloads: &[u8],
+    line: &mut Vec<u8>,
     dumpvars_state: &mut u8,
     current_time: &mut Option<u64>,
 ) -> std::io::Result<()> {
+    line.clear();
     for &(time, start, len) in changes {
         if *current_time != Some(time) {
             // The reference opens `$dumpvars` at the first dumped time and
             // closes it at the second; on the frame path the state starts
             // closed so neither happens here.
             if *dumpvars_state == 1 {
-                out.write_all(b"$end\n")?;
+                line.extend_from_slice(b"$end\n");
                 *dumpvars_state = 2;
             }
-            out.write_all(b"#")?;
-            write_u64(out, time)?;
-            out.write_all(b"\n")?;
+            line.push(b'#');
+            push_u64(line, time);
+            line.push(b'\n');
             if *dumpvars_state == 0 {
-                out.write_all(b"$dumpvars\n")?;
+                line.extend_from_slice(b"$dumpvars\n");
                 *dumpvars_state = 1;
             }
             *current_time = Some(time);
@@ -1426,9 +1436,9 @@ fn emit_block_changes<W: Write>(
         // The change's complete VCD line was rendered on the decode thread; a
         // change on an undeclared variable has a zero-length range and emits
         // nothing but still advanced `#time` above.
-        out.write_all(&payloads[start as usize..(start + len) as usize])?;
+        line.extend_from_slice(&payloads[start as usize..(start + len) as usize]);
     }
-    Ok(())
+    out.write_all(line)
 }
 
 /// Maps each byte to its 8 bits as ASCII `'0'`/`'1'`, most-significant bit
