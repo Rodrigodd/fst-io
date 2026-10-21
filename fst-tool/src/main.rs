@@ -937,7 +937,7 @@ fn write_vcd_value_changes<W: Write>(
     // The writer runs on THIS (main) thread because `out` is not `Send`. Workers
     // and the dispatcher are scoped threads; they borrow the shared read-only
     // metadata (`ids`, `lengths`, `vars` via the writer) and the buffer pool.
-    std::thread::scope(|scope| -> std::io::Result<()> {
+    let result = std::thread::scope(|scope| -> std::io::Result<()> {
         // Worker threads: pull a job, decode its block, send the result.
         for i in 0..threads {
             let work_rx = &work_rx;
@@ -1083,7 +1083,12 @@ fn write_vcd_value_changes<W: Write>(
         drop(result_rx);
 
         result
-    })
+    });
+
+    // dropping the buffers is surprisingly slow
+    std::mem::forget(pool);
+
+    result
 }
 
 /// A block handed to a worker for decoding, tagged with its position in the
