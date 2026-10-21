@@ -764,15 +764,26 @@ fn write_vcd_header<W: Write>(out: &mut W, header: &HeaderBlock) -> std::io::Res
     )
 }
 
+/// A buffered scope used when filtering, so a scope containing no selected
+/// variable can be dropped. Its `$scope` line and body (nested declarations)
+/// are held until `$upscope`; the frame is flushed to its parent only if a
+/// selected variable set `non_empty`.
+struct ScopeFrame {
+    scope_line: String,
+    body: Vec<u8>,
+    non_empty: bool,
+}
+
 /// Writes the `$scope`/`$var`/`$upscope` declarations, returning a map from
 /// variable id to its VCD metadata. Every declared variable (including
 /// aliases) gets a `$var` line sharing the aliased id's code.
 ///
 /// When `filter` is non-empty, only variables it selects get a `$var` line, and
 /// an id with no selected `$var` line is left `None` so the value-change path
-/// renders nothing for it. The geometry length is still consumed for every
-/// canonical variable and the id table stays dense, so filtering never shifts
-/// the id-to-geometry mapping.
+/// renders nothing for it. A scope that ends up containing no selected variable
+/// (directly or in a nested scope) is omitted entirely. The geometry length is
+/// still consumed for every canonical variable and the id table stays dense, so
+/// filtering never shifts the id-to-geometry mapping.
 fn write_vcd_declarations<W: Write>(
     out: &mut W,
     input: &Path,
@@ -792,6 +803,10 @@ fn write_vcd_declarations<W: Write>(
     // Enclosing scope names, for matching a variable's full dotted path. Empty
     // unless a filter is active, so the no-filter path pays nothing.
     let mut scopes: Vec<String> = Vec::new();
+    // Buffered scope frames, used only when filtering so an empty scope can be
+    // dropped: a scope's `$scope` line and body are held here and flushed to
+    // the parent (or `out`) only once a selected variable makes it non-empty.
+    let mut frames: Vec<ScopeFrame> = Vec::new();
 
     for_each_hierarchy_entry(input, |entry| {
         match entry {
@@ -800,23 +815,54 @@ fn write_vcd_declarations<W: Write>(
             } => {
                 let type_name = scope_type_name(scope_type).unwrap_or("module");
                 let name = String::from_utf8_lossy(&name).into_owned();
-                if name.is_empty() {
-                    writeln!(
-                        out,
-                        "$scope {type_name} $unnamed_scope_{unnamed_scope} $end"
-                    )?;
+                let scope_line = if name.is_empty() {
+                    let line = format!("$scope {type_name} $unnamed_scope_{unnamed_scope} $end\n");
                     unnamed_scope += 1;
+                    line
                 } else {
-                    writeln!(out, "$scope {type_name} {name} $end")?;
-                }
-                if !filter.is_empty() {
+                    format!("$scope {type_name} {name} $end\n")
+                };
+                if filter.is_empty() {
+                    out.write_all(scope_line.as_bytes())?;
+                } else {
                     scopes.push(name);
+                    frames.push(ScopeFrame {
+                        scope_line,
+                        body: Vec::new(),
+                        non_empty: false,
+                    });
                 }
             }
             HierarchyEntry::UpScope => {
-                writeln!(out, "$upscope $end")?;
-                if !filter.is_empty() {
+                if filter.is_empty() {
+                    writeln!(out, "$upscope $end")?;
+                } else {
                     scopes.pop();
+                    // An unbalanced `$upscope` (malformed input) has no frame
+                    // to close; ignore it, matching the unfiltered path which
+                    // just writes the bare `$upscope`.
+                    let Some(frame) = frames.pop() else {
+                        return Ok(());
+                    };
+                    if frame.non_empty {
+                        // Flush the scope (and its now-non-empty body) into the
+                        // parent frame, or to `out` at the top level.
+                        let sink: &mut Vec<u8> = match frames.last_mut() {
+                            Some(parent) => {
+                                parent.non_empty = true;
+                                &mut parent.body
+                            }
+                            None => {
+                                out.write_all(&frame.scope_line.into_bytes())?;
+                                out.write_all(&frame.body)?;
+                                out.write_all(b"$upscope $end\n")?;
+                                return Ok(());
+                            }
+                        };
+                        sink.extend_from_slice(frame.scope_line.as_bytes());
+                        sink.extend_from_slice(&frame.body);
+                        sink.extend_from_slice(b"$upscope $end\n");
+                    }
                 }
             }
             HierarchyEntry::Var {
@@ -844,7 +890,16 @@ fn write_vcd_declarations<W: Write>(
                     length
                 };
                 if selected {
-                    writeln!(out, "$var {type_name} {vcd_length} {code} {name} $end")?;
+                    let var_line = format!("$var {type_name} {vcd_length} {code} {name} $end\n");
+                    match frames.last_mut() {
+                        // A selected variable makes its scope non-empty, which
+                        // keeps every enclosing scope on flush.
+                        Some(frame) => {
+                            frame.non_empty = true;
+                            frame.body.extend_from_slice(var_line.as_bytes());
+                        }
+                        None => out.write_all(var_line.as_bytes())?,
+                    }
                 }
 
                 let idx = id as usize;
