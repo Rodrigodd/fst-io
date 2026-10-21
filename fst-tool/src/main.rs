@@ -794,9 +794,6 @@ fn write_vcd_declarations<W: Write>(
     // a Vec avoids a per-value-change hash lookup in the hot emit loop; any
     // gap stays `None`.
     let mut vars: Vec<Option<VcdVar>> = Vec::new();
-    // Whether any `$var` line of an id was selected by the filter, indexed by
-    // id. An id never selected is pruned from `vars` after the walk.
-    let mut kept: Vec<bool> = Vec::new();
     // The geometry lengths are indexed by non-aliased variable id - 1.
     let mut next_length = 0usize;
     let mut unnamed_scope = 0u32;
@@ -807,6 +804,12 @@ fn write_vcd_declarations<W: Write>(
     // dropped: a scope's `$scope` line and body are held here and flushed to
     // the parent (or `out`) only once a selected variable makes it non-empty.
     let mut frames: Vec<ScopeFrame> = Vec::new();
+    // Minimal VCD identifier codes for the filtered path: each selected id is
+    // assigned the next dense 1-based code in first-appearance order, so the
+    // output uses the shortest codes regardless of how sparse the selected ids
+    // are in the original space. Unused without a filter.
+    let mut minimal_codes: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut next_code = 1u64;
 
     for_each_hierarchy_entry(input, |entry| {
         match entry {
@@ -877,7 +880,22 @@ fn write_vcd_declarations<W: Write>(
                 let selected = filter.selects(&scopes, &name);
                 let type_name = var_type_name(var_type).unwrap_or("wire");
                 // The VCD identifier code is 1-based; fst-io ids are 0-based.
-                let code = vcd_id(id + 1);
+                // When filtering, a selected id is renumbered densely so the
+                // emitted codes stay minimal; all `$var` lines of one id (an
+                // alias and its canonical) share the one code.
+                let code = if filter.is_empty() {
+                    vcd_id(id + 1)
+                } else if selected {
+                    let number = *minimal_codes.entry(id).or_insert_with(|| {
+                        let n = next_code;
+                        next_code += 1;
+                        n
+                    });
+                    vcd_id(number)
+                } else {
+                    // Not emitted; the value is unused.
+                    String::new()
+                };
                 // The VCD length: ports pack three VCD chars per bit, reals are
                 // fixed width, everything else is the bit length.
                 let vcd_length = if var_type == VAR_TYPE_PORT {
@@ -903,10 +921,6 @@ fn write_vcd_declarations<W: Write>(
                 }
 
                 let idx = id as usize;
-                if idx >= kept.len() {
-                    kept.resize(idx + 1, false);
-                }
-                kept[idx] |= selected;
 
                 // A non-aliased variable consumes the next geometry length and
                 // becomes the id's canonical decode info. An alias reuses the
@@ -935,11 +949,19 @@ fn write_vcd_declarations<W: Write>(
 
     // Prune ids no `$var` line selected: the value-change path treats a `None`
     // entry exactly like an undeclared variable and renders nothing for it, so
-    // the filter costs nothing in the decode hot loop.
+    // the filter costs nothing in the decode hot loop. A kept id also gets its
+    // minimal code stamped in, since the code assigned when its `vars` entry
+    // was first built may predate the (minimal) code a later selected alias of
+    // the same id established.
     if !filter.is_empty() {
         for (idx, var) in vars.iter_mut().enumerate() {
-            if !kept.get(idx).copied().unwrap_or(false) {
-                *var = None;
+            match minimal_codes.get(&(idx as u64)) {
+                Some(&number) => {
+                    if let Some(var) = var {
+                        var.code = vcd_id(number);
+                    }
+                }
+                None => *var = None,
             }
         }
     }
