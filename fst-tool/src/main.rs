@@ -958,6 +958,7 @@ fn write_vcd_value_changes<W: Write>(
                             job.changes,
                             job.scratch,
                             job.payloads,
+                            job.offsets,
                             ids,
                             lengths,
                             vars,
@@ -991,7 +992,8 @@ fn write_vcd_value_changes<W: Write>(
                 let mut dispatch = |section: Section<std::io::Cursor<Vec<u8>>>,
                                     changes: Vec<Change>,
                                     scratch: Vec<Change>,
-                                    payloads: Vec<u8>|
+                                    payloads: Vec<u8>,
+                                    offsets: Vec<u32>|
                  -> bool {
                     let _ = work_tx.send(Job {
                         seq,
@@ -999,6 +1001,7 @@ fn write_vcd_value_changes<W: Write>(
                         changes,
                         scratch,
                         payloads,
+                        offsets,
                     });
                     seq += 1;
                     true
@@ -1011,7 +1014,13 @@ fn write_vcd_value_changes<W: Write>(
                     let Some(bundle) = pool.take() else {
                         return Ok(());
                     };
-                    if !dispatch(first_block, bundle.changes, bundle.scratch, bundle.payloads) {
+                    if !dispatch(
+                        first_block,
+                        bundle.changes,
+                        bundle.scratch,
+                        bundle.payloads,
+                        bundle.offsets,
+                    ) {
                         return Ok(());
                     }
                     while let Some(section) = iterator.next()? {
@@ -1027,7 +1036,13 @@ fn write_vcd_value_changes<W: Write>(
                         if value_change_start_time(&section)? > end {
                             break;
                         }
-                        if !dispatch(section, bundle.changes, bundle.scratch, bundle.payloads) {
+                        if !dispatch(
+                            section,
+                            bundle.changes,
+                            bundle.scratch,
+                            bundle.payloads,
+                            bundle.offsets,
+                        ) {
                             break;
                         }
                     }
@@ -1081,6 +1096,7 @@ fn write_vcd_value_changes<W: Write>(
                         changes: decoded.changes,
                         scratch: decoded.scratch,
                         payloads: decoded.payloads,
+                        offsets: decoded.offsets,
                     });
                 }
             }
@@ -1116,6 +1132,7 @@ struct Job {
     changes: Vec<Change>,
     scratch: Vec<Change>,
     payloads: Vec<u8>,
+    offsets: Vec<u32>,
 }
 
 /// A worker's decoded output: the block's in-range changes, time-sorted, plus
@@ -1127,6 +1144,7 @@ struct Decoded {
     bytes: Vec<u8>,
     scratch: Vec<Change>,
     payloads: Vec<u8>,
+    offsets: Vec<u32>,
 }
 
 /// Decodes one in-range block into its time-sorted change list. This is the
@@ -1141,6 +1159,7 @@ fn decode_block_changes(
     mut changes: Vec<Change>,
     mut scratch: Vec<Change>,
     mut payloads: Vec<u8>,
+    mut offsets: Vec<u32>,
     ids: &[u64],
     lengths: &[VariableLength],
     vars: &[Option<VcdVar>],
@@ -1203,8 +1222,10 @@ fn decode_block_changes(
     // per-variable order within each time step, matching the reference.
     let n = changes.len();
     let bucket_count = times.len();
-    // Per-bucket start offsets via a prefix sum of the counts.
-    let mut offsets = vec![0u32; bucket_count + 1];
+    // Per-bucket start offsets via a prefix sum of the counts. The buffer is
+    // recycled through the pool, so this allocates nothing per block.
+    offsets.clear();
+    offsets.resize(bucket_count + 1, 0);
     for &(time_index, _, _) in &changes {
         offsets[time_index as usize + 1] += 1;
     }
@@ -1233,6 +1254,7 @@ fn decode_block_changes(
         bytes,
         scratch,
         payloads,
+        offsets,
     })
 }
 
@@ -1289,7 +1311,6 @@ fn rebuffer(
 /// dispatcher could otherwise block forever in `acquire` (no permits are ever
 /// released again), which would hang the scope that joins every thread.
 /// Shutting down makes every current and future `acquire` return immediately.
-/// One value change: `(time, id, value)`, time-sorted within a block.
 /// One value change, time-sorted within a block: the resolved `time` plus the
 /// `[start, len)` byte range of its COMPLETE pre-rendered VCD line (value +
 /// code + `\n`) in the block's payload arena. The line is rendered on the
@@ -1313,6 +1334,9 @@ struct Buffers {
     /// `[start, len)` ranges in the change descriptors. Recycled per block so
     /// the per-change `Vec<u8>` allocations are gone.
     payloads: Vec<u8>,
+    /// Counting-sort bucket offsets (`bucket_count + 1` entries), recycled so
+    /// the sort allocates and zero-fills no fresh vector per block.
+    offsets: Vec<u32>,
 }
 
 /// A bounded pool of reusable [`Buffers`], built on the standard library only
