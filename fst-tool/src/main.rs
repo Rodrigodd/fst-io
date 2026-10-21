@@ -732,7 +732,17 @@ fn vcd(
     let vars = write_vcd_declarations(&mut out, input, &lengths, &filter)?;
     writeln!(out, "$enddefinitions $end")?;
 
-    write_vcd_value_changes(&mut out, input, &lengths, &vars, &header, start, end, jobs)?;
+    write_vcd_value_changes(
+        &mut out,
+        input,
+        &lengths,
+        &vars,
+        &header,
+        start,
+        end,
+        jobs,
+        !filter.is_empty(),
+    )?;
 
     out.flush()
 }
@@ -912,6 +922,7 @@ fn write_vcd_value_changes<W: Write>(
     start: u64,
     end: u64,
     threads: usize,
+    filter_active: bool,
 ) -> std::io::Result<()> {
     let real_endianness = header.real_endianness;
 
@@ -1108,6 +1119,7 @@ fn write_vcd_value_changes<W: Write>(
                             real_endianness,
                             start,
                             end,
+                            filter_active,
                         );
                         // A send failure means the writer is gone (an earlier error
                         // tore down the scope); stop quietly.
@@ -1318,6 +1330,7 @@ fn decode_block_changes(
     real_endianness: RealEndianess,
     start: u64,
     end: u64,
+    filter_active: bool,
 ) -> std::io::Result<Decoded> {
     changes.clear();
     payloads.clear();
@@ -1340,9 +1353,15 @@ fn decode_block_changes(
     // its full VCD line (value + code + '\n'). Each variable's run is already
     // time-ordered; the runs are concatenated here and ordered globally below.
     for (geometry_index, &id) in ids.iter().enumerate() {
-        // A variable with no entry emits no value text, but its changes are
-        // still kept so the writer sees their `#time`.
         let var = vars.get(id as usize).and_then(Option::as_ref);
+        // When filtering, a discarded variable is skipped outright: its waves
+        // are not even decoded, and it records no change, so a time step whose
+        // only changes are on discarded variables produces no `#time`. Without
+        // a filter, a variable with no entry still records zero-length changes
+        // so the writer sees their `#time`, matching the unfiltered reference.
+        if var.is_none() && filter_active {
+            continue;
+        }
         let waves = block.read_waves(&head, &positions, id, lengths[geometry_index])?;
         for change in waves.iter() {
             let (time_index, value) = change?;
