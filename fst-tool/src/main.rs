@@ -921,12 +921,13 @@ fn write_vcd_value_changes<W: Write>(
     // --- Parallel decode: workers decode blocks, the writer emits them in
     // order. ---
     let threads = threads.max(1);
-    let in_flight_cap = threads + 1;
+    let pool_size = threads + 1;
 
-    // Bounds blocks dispatched-but-not-yet-written to `in_flight_cap`: the main
-    // thread acquires a permit before dispatching a block, the writer releases
-    // one after writing it.
-    let in_flight = Semaphore::new(in_flight_cap);
+    // A bounded pool of reusable byte/change buffers. It also provides the
+    // pipeline's backpressure: the dispatcher takes a bundle before reading a
+    // block and the writer returns it after emitting, so at most `pool_size`
+    // blocks are ever in flight -- no separate semaphore needed.
+    let pool = BufferPool::new(pool_size);
 
     // Work queue (main -> workers) and result queue (workers -> writer).
     let (work_tx, work_rx) = std::sync::mpsc::channel::<Job>();
@@ -935,7 +936,7 @@ fn write_vcd_value_changes<W: Write>(
 
     // The writer runs on THIS (main) thread because `out` is not `Send`. Workers
     // and the dispatcher are scoped threads; they borrow the shared read-only
-    // metadata (`ids`, `lengths`, `vars` via the writer) and the semaphore.
+    // metadata (`ids`, `lengths`, `vars` via the writer) and the buffer pool.
     std::thread::scope(|scope| -> std::io::Result<()> {
         // Worker threads: pull a job, decode its block, send the result.
         for i in 0..threads {
@@ -951,8 +952,15 @@ fn write_vcd_value_changes<W: Write>(
                             guard.recv()
                         };
                         let Ok(job) = job else { break };
-                        let decoded =
-                            decode_block_changes(job.seq, job.section, ids, lengths, start, end);
+                        let decoded = decode_block_changes(
+                            job.seq,
+                            job.section,
+                            job.changes,
+                            ids,
+                            lengths,
+                            start,
+                            end,
+                        );
                         // A send failure means the writer is gone (an earlier error
                         // tore down the scope); stop quietly.
                         if result_tx.send(decoded).is_err() {
@@ -963,39 +971,53 @@ fn write_vcd_value_changes<W: Write>(
         }
 
         // Dispatcher thread: feed in-range blocks to the workers in sequence
-        // order, blocking on the semaphore so the number of blocks in flight
-        // stays bounded. A fatal read error is sent to the writer so the main
-        // thread observes it; a shutdown (writer stopped early) aborts dispatch.
+        // order, taking a buffer bundle from the pool first so the number of
+        // blocks in flight stays bounded (an empty pool blocks here). A fatal
+        // read error is sent to the writer so the main thread observes it; a
+        // pool shutdown (writer stopped early) aborts dispatch.
         let dispatch_tx = result_tx.clone();
-        let in_flight = &in_flight;
+        let pool = &pool;
         std::thread::Builder::new()
             .name("vcd-dispatch".to_string())
             .spawn_scoped(scope, move || {
                 let mut seq = 0u64;
-                // Returns false if the semaphore was shut down, meaning stop.
-                let mut dispatch = |section: Section<std::io::Cursor<Vec<u8>>>| -> bool {
-                    if !in_flight.acquire() {
-                        return false;
-                    }
-                    let _ = work_tx.send(Job { seq, section });
-                    seq += 1;
-                    true
-                };
+                // Sends a job carrying a recycled changes buffer. Returns false
+                // if the pool was shut down, meaning stop.
+                let mut dispatch =
+                    |section: Section<std::io::Cursor<Vec<u8>>>, changes: Vec<Change>| -> bool {
+                        let _ = work_tx.send(Job {
+                            seq,
+                            section,
+                            changes,
+                        });
+                        seq += 1;
+                        true
+                    };
 
                 let run = || -> std::io::Result<()> {
-                    if !dispatch(first_block) {
+                    // The first block was already buffered by the prelude; take
+                    // a bundle only for its recycled changes buffer (its own
+                    // bytes become a pool buffer once the writer returns them).
+                    let Some(bundle) = pool.take() else {
+                        return Ok(());
+                    };
+                    if !dispatch(first_block, bundle.changes) {
                         return Ok(());
                     }
                     while let Some(section) = iterator.next()? {
                         if !is_value_change(section.block_type()) {
                             continue;
                         }
-                        let section = section.buffer()?;
+                        // Reuse a recycled byte buffer for the section bytes.
+                        let Some(bundle) = pool.take() else {
+                            break;
+                        };
+                        let section = section.buffer_reusing(bundle.bytes)?;
                         // Stop once a block starts past the range.
                         if value_change_start_time(&section)? > end {
                             break;
                         }
-                        if !dispatch(section) {
+                        if !dispatch(section, bundle.changes) {
                             break;
                         }
                     }
@@ -1014,12 +1036,12 @@ fn write_vcd_value_changes<W: Write>(
 
         // Writer loop (main thread): reassemble decoded blocks in sequence
         // order and emit them as one serial VCD stream. The result is captured
-        // rather than propagated with `?`, so that on ANY exit the semaphore is
-        // shut down and the result receiver dropped -- otherwise the dispatcher
-        // could block forever in `acquire` and workers in `recv`, hanging the
+        // rather than propagated with `?`, so that on ANY exit the pool is shut
+        // down and the result receiver dropped -- otherwise the dispatcher
+        // could block forever in `take` and workers in `recv`, hanging the
         // scope that joins them.
         let mut next_seq = 0u64;
-        let mut pending: std::collections::BTreeMap<u64, Vec<(u64, u64, RenderedValue)>> =
+        let mut pending: std::collections::BTreeMap<u64, Decoded> =
             std::collections::BTreeMap::new();
         let mut dumpvars_state = initial_dumpvars_state;
         let mut current_time = initial_time;
@@ -1027,26 +1049,29 @@ fn write_vcd_value_changes<W: Write>(
         let mut write_loop = || -> std::io::Result<()> {
             while let Ok(result) = result_rx.recv() {
                 let decoded = result?;
-                pending.insert(decoded.seq, decoded.changes);
+                pending.insert(decoded.seq, decoded);
                 // Emit every block that is now contiguous from next_seq.
-                while let Some(changes) = pending.remove(&next_seq) {
+                while let Some(decoded) = pending.remove(&next_seq) {
                     emit_block_changes(
                         out,
-                        &changes,
+                        &decoded.changes,
                         vars,
                         real_endianness,
                         &mut dumpvars_state,
                         &mut current_time,
                     )?;
                     next_seq += 1;
-                    // One block written: free a permit so the dispatcher may
-                    // send another, keeping in-flight <= 2 * threads.
-                    in_flight.release();
+                    // One block written: return its buffers to the pool so the
+                    // dispatcher may read another, keeping in-flight bounded.
+                    pool.give(Buffers {
+                        bytes: decoded.bytes,
+                        changes: decoded.changes,
+                    });
                 }
             }
             // Close a dumpvars section left open by a single-time-step dump.
             if dumpvars_state == 1 {
-                writeln!(out, "$end")?;
+                out.write_all(b"$end\n")?;
             }
             Ok(())
         };
@@ -1054,7 +1079,7 @@ fn write_vcd_value_changes<W: Write>(
 
         // Unblock the dispatcher and workers so the scope can join cleanly,
         // whether the writer finished normally or bailed on an error.
-        in_flight.shutdown();
+        pool.shutdown();
         drop(result_rx);
 
         result
@@ -1062,36 +1087,45 @@ fn write_vcd_value_changes<W: Write>(
 }
 
 /// A block handed to a worker for decoding, tagged with its position in the
-/// dump so the writer can reassemble the results in order.
+/// dump so the writer can reassemble the results in order. `changes` is an
+/// empty, capacity-retaining vector recycled from the pool for the worker to
+/// fill.
 struct Job {
     seq: u64,
     section: Section<std::io::Cursor<Vec<u8>>>,
+    changes: Vec<Change>,
 }
 
-/// A worker's decoded output: the block's in-range changes, time-sorted.
+/// A worker's decoded output: the block's in-range changes, time-sorted, plus
+/// the section byte buffer recovered from the consumed block. Both travel back
+/// to the writer, which recycles them into the pool after emitting.
 struct Decoded {
     seq: u64,
-    changes: Vec<(u64, u64, RenderedValue)>,
+    changes: Vec<Change>,
+    bytes: Vec<u8>,
 }
 
 /// Decodes one in-range block into its time-sorted change list. This is the
 /// parallel hot path: it runs on a worker thread and touches only its own
-/// buffered block plus the shared read-only metadata.
+/// buffered block plus the shared read-only metadata. The `changes` buffer is
+/// reused (cleared first); the section's backing bytes are recovered and
+/// returned for recycling.
 fn decode_block_changes(
     seq: u64,
     section: Section<std::io::Cursor<Vec<u8>>>,
+    mut changes: Vec<Change>,
     ids: &[u64],
     lengths: &[VariableLength],
     start: u64,
     end: u64,
 ) -> std::io::Result<Decoded> {
+    changes.clear();
     let mut block = section.read_value_changes()?;
     let head = block.read_head_layout()?;
     let tail = block.read_tail_layout()?;
     let positions = block.read_positions(&head, &tail)?;
     let times = block.read_time_table(&tail)?;
 
-    let mut changes: Vec<(u64, u64, RenderedValue)> = Vec::new();
     for (geometry_index, &id) in ids.iter().enumerate() {
         let waves = block.read_waves(&head, &positions, id, lengths[geometry_index])?;
         for change in waves.iter() {
@@ -1110,7 +1144,13 @@ fn decode_block_changes(
     }
     // Stable sort by time keeps per-variable order within a time step.
     changes.sort_by_key(|&(time, _, _)| time);
-    Ok(Decoded { seq, changes })
+    // Recover the section's backing bytes so the writer can recycle them.
+    let bytes = block.data.into_inner();
+    Ok(Decoded {
+        seq,
+        changes,
+        bytes,
+    })
 }
 
 /// Reads a buffered value change block's start time without consuming it.
@@ -1166,48 +1206,81 @@ fn rebuffer(
 /// dispatcher could otherwise block forever in `acquire` (no permits are ever
 /// released again), which would hang the scope that joins every thread.
 /// Shutting down makes every current and future `acquire` return immediately.
-struct Semaphore {
-    state: std::sync::Mutex<SemaphoreState>,
+/// One value change: `(time, id, value)`, time-sorted within a block.
+type Change = (u64, u64, RenderedValue);
+
+/// The two reusable buffers that circulate with one in-flight block: the raw
+/// section bytes a worker decodes, and the change list it produces. Bundling
+/// them means one pool slot bounds in-flight blocks and recycles both
+/// allocations.
+#[derive(Default)]
+struct Buffers {
+    /// Backing bytes for the buffered section handed to a worker.
+    bytes: Vec<u8>,
+    /// The decoded, time-sorted change list handed to the writer.
+    changes: Vec<Change>,
+}
+
+/// A bounded pool of reusable [`Buffers`], built on the standard library only
+/// (fst-tool takes no threading dependency).
+///
+/// It doubles as the pipeline's backpressure: the pool is seeded with a fixed
+/// number of bundles, the dispatcher `take`s one before reading a block (an
+/// empty pool blocks it), and the writer `give`s it back after emitting the
+/// block (which wakes the dispatcher). So the number of blocks in flight can
+/// never exceed the pool size, and no separate semaphore is needed.
+///
+/// `shutdown` exists for the error path: if the writer stops early, the
+/// dispatcher could otherwise block forever in `take` (no bundle is ever
+/// returned again), which would hang the scope that joins every thread.
+/// Shutting down makes every current and future `take` return `None`.
+struct BufferPool {
+    state: std::sync::Mutex<PoolState>,
     available: std::sync::Condvar,
 }
 
-struct SemaphoreState {
-    permits: usize,
+struct PoolState {
+    free: Vec<Buffers>,
     shutdown: bool,
 }
 
-impl Semaphore {
-    fn new(permits: usize) -> Self {
-        Semaphore {
-            state: std::sync::Mutex::new(SemaphoreState {
-                permits,
+impl BufferPool {
+    /// Creates a pool seeded with `size` empty bundles. `size` is the maximum
+    /// number of blocks that can be in flight at once.
+    fn new(size: usize) -> Self {
+        let mut free = Vec::with_capacity(size);
+        free.resize_with(size, Buffers::default);
+        BufferPool {
+            state: std::sync::Mutex::new(PoolState {
+                free,
                 shutdown: false,
             }),
             available: std::sync::Condvar::new(),
         }
     }
 
-    /// Blocks for a permit. Returns `true` on success, `false` if the semaphore
-    /// was shut down (in which case no permit was taken).
-    fn acquire(&self) -> bool {
+    /// Blocks for a free bundle. Returns `None` if the pool was shut down (in
+    /// which case nothing was taken).
+    fn take(&self) -> Option<Buffers> {
         let mut state = self.state.lock().unwrap();
-        while state.permits == 0 && !state.shutdown {
+        while state.free.is_empty() && !state.shutdown {
             state = self.available.wait(state).unwrap();
         }
         if state.shutdown {
-            return false;
+            return None;
         }
-        state.permits -= 1;
-        true
+        state.free.pop()
     }
 
-    fn release(&self) {
+    /// Returns a bundle to the pool and wakes a waiter. The buffers keep their
+    /// capacity for reuse; they are cleared on next fill.
+    fn give(&self, buffers: Buffers) {
         let mut state = self.state.lock().unwrap();
-        state.permits += 1;
+        state.free.push(buffers);
         self.available.notify_one();
     }
 
-    /// Wakes every waiter and makes all future `acquire` calls return `false`.
+    /// Wakes every waiter and makes all future `take` calls return `None`.
     fn shutdown(&self) {
         let mut state = self.state.lock().unwrap();
         state.shutdown = true;
@@ -1535,5 +1608,67 @@ mod tests {
     fn c_string_stops_at_the_first_nul() {
         assert_eq!(c_string(b"fstWriter\0\0\0"), "fstWriter");
         assert_eq!(c_string(b"no terminator"), "no terminator");
+    }
+
+    #[test]
+    fn buffer_pool_recycles_allocation() {
+        // A bundle returned to the pool comes back out with its capacity
+        // intact, so the next fill reuses the same allocation instead of
+        // allocating a fresh one.
+        let pool = BufferPool::new(1);
+        let mut bundle = pool.take().unwrap();
+        bundle.bytes.extend_from_slice(&[0u8; 1024]);
+        bundle.changes.reserve(64);
+        let bytes_ptr = bundle.bytes.as_ptr();
+        let bytes_cap = bundle.bytes.capacity();
+        let changes_cap = bundle.changes.capacity();
+        pool.give(bundle);
+
+        let reused = pool.take().unwrap();
+        assert_eq!(
+            reused.bytes.as_ptr(),
+            bytes_ptr,
+            "byte buffer was reallocated"
+        );
+        assert_eq!(reused.bytes.capacity(), bytes_cap);
+        assert!(reused.changes.capacity() >= changes_cap);
+    }
+
+    #[test]
+    fn buffer_pool_take_blocks_until_given_then_shutdown_unblocks() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        // An empty pool blocks `take` (this is the dispatcher backpressure);
+        // a `give` wakes it. The waiter returns its bundle so the pool is not
+        // left empty for the next phase.
+        let pool = Arc::new(BufferPool::new(1));
+        let only = pool.take().unwrap();
+        let p2 = Arc::clone(&pool);
+        let waiter = std::thread::spawn(move || match p2.take() {
+            Some(bundle) => {
+                p2.give(bundle);
+                true
+            }
+            None => false,
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        pool.give(only);
+        assert!(
+            waiter.join().unwrap(),
+            "give should let a blocked take succeed"
+        );
+
+        // With the pool empty again, shutdown makes a blocked take return None
+        // (this is the error-path escape that prevents a join deadlock).
+        let _held = pool.take().unwrap();
+        let p3 = Arc::clone(&pool);
+        let waiter = std::thread::spawn(move || p3.take().is_none());
+        std::thread::sleep(Duration::from_millis(20));
+        pool.shutdown();
+        assert!(
+            waiter.join().unwrap(),
+            "shutdown should unblock take as None"
+        );
     }
 }

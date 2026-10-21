@@ -78,15 +78,24 @@ impl<R: Read> Section<R> {
     /// form, since both the borrowed reader and the buffer implement
     /// [`SectionData`].
     pub fn buffer(self) -> std::io::Result<Section<Cursor<Vec<u8>>>> {
-        let mut data = Vec::with_capacity(to_usize(self.len).unwrap_or(0));
-        let read = self.data.take(self.len).read_to_end(&mut data)?;
+        self.buffer_reusing(Vec::new())
+    }
+
+    /// Like [`Section::buffer`], but reads into a caller-provided `Vec`,
+    /// reusing its capacity. The buffer is cleared first, so any previous
+    /// contents are discarded. Use this to recycle one allocation across many
+    /// sections instead of allocating a fresh buffer per section.
+    pub fn buffer_reusing(self, mut buf: Vec<u8>) -> std::io::Result<Section<Cursor<Vec<u8>>>> {
+        buf.clear();
+        buf.reserve(to_usize(self.len).unwrap_or(0));
+        let read = self.data.take(self.len).read_to_end(&mut buf)?;
         if read as u64 != self.len {
             return Err(std::io::ErrorKind::UnexpectedEof.into());
         }
         Ok(Section {
             block_type: self.block_type,
             len: self.len,
-            data: Cursor::new(data),
+            data: Cursor::new(buf),
         })
     }
 }
