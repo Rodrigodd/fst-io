@@ -957,6 +957,7 @@ fn write_vcd_value_changes<W: Write>(
                             job.section,
                             job.changes,
                             job.scratch,
+                            job.payloads,
                             ids,
                             lengths,
                             start,
@@ -987,13 +988,15 @@ fn write_vcd_value_changes<W: Write>(
                 // stop.
                 let mut dispatch = |section: Section<std::io::Cursor<Vec<u8>>>,
                                     changes: Vec<Change>,
-                                    scratch: Vec<Change>|
+                                    scratch: Vec<Change>,
+                                    payloads: Vec<u8>|
                  -> bool {
                     let _ = work_tx.send(Job {
                         seq,
                         section,
                         changes,
                         scratch,
+                        payloads,
                     });
                     seq += 1;
                     true
@@ -1006,7 +1009,7 @@ fn write_vcd_value_changes<W: Write>(
                     let Some(bundle) = pool.take() else {
                         return Ok(());
                     };
-                    if !dispatch(first_block, bundle.changes, bundle.scratch) {
+                    if !dispatch(first_block, bundle.changes, bundle.scratch, bundle.payloads) {
                         return Ok(());
                     }
                     while let Some(section) = iterator.next()? {
@@ -1022,7 +1025,7 @@ fn write_vcd_value_changes<W: Write>(
                         if value_change_start_time(&section)? > end {
                             break;
                         }
-                        if !dispatch(section, bundle.changes, bundle.scratch) {
+                        if !dispatch(section, bundle.changes, bundle.scratch, bundle.payloads) {
                             break;
                         }
                     }
@@ -1060,6 +1063,7 @@ fn write_vcd_value_changes<W: Write>(
                     emit_block_changes(
                         out,
                         &decoded.changes,
+                        &decoded.payloads,
                         vars,
                         real_endianness,
                         &mut dumpvars_state,
@@ -1072,6 +1076,7 @@ fn write_vcd_value_changes<W: Write>(
                         bytes: decoded.bytes,
                         changes: decoded.changes,
                         scratch: decoded.scratch,
+                        payloads: decoded.payloads,
                     });
                 }
             }
@@ -1106,6 +1111,7 @@ struct Job {
     section: Section<std::io::Cursor<Vec<u8>>>,
     changes: Vec<Change>,
     scratch: Vec<Change>,
+    payloads: Vec<u8>,
 }
 
 /// A worker's decoded output: the block's in-range changes, time-sorted, plus
@@ -1116,6 +1122,7 @@ struct Decoded {
     changes: Vec<Change>,
     bytes: Vec<u8>,
     scratch: Vec<Change>,
+    payloads: Vec<u8>,
 }
 
 /// Decodes one in-range block into its time-sorted change list. This is the
@@ -1129,12 +1136,14 @@ fn decode_block_changes(
     section: Section<std::io::Cursor<Vec<u8>>>,
     mut changes: Vec<Change>,
     mut scratch: Vec<Change>,
+    mut payloads: Vec<u8>,
     ids: &[u64],
     lengths: &[VariableLength],
     start: u64,
     end: u64,
 ) -> std::io::Result<Decoded> {
     changes.clear();
+    payloads.clear();
     let mut block = section.read_value_changes()?;
     let head = block.read_head_layout()?;
     let tail = block.read_tail_layout()?;
@@ -1157,7 +1166,11 @@ fn decode_block_changes(
             if time < start || time > end {
                 continue;
             }
-            changes.push((time_index, id, RenderedValue::from_value(&value)));
+            changes.push((
+                time_index,
+                id,
+                RenderedValue::from_value(&value, &mut payloads),
+            ));
         }
     }
 
@@ -1196,6 +1209,7 @@ fn decode_block_changes(
         changes,
         bytes,
         scratch,
+        payloads,
     })
 }
 
@@ -1268,6 +1282,10 @@ struct Buffers {
     /// Scratch scatter target for the counting sort, recycled alongside the
     /// rest so the sort allocates nothing per block.
     scratch: Vec<Change>,
+    /// Arena holding one block's variable-length payload bytes, referenced by
+    /// `[start, len)` ranges in the change descriptors. Recycled per block so
+    /// the per-change `Vec<u8>` allocations are gone.
+    payloads: Vec<u8>,
 }
 
 /// A bounded pool of reusable [`Buffers`], built on the standard library only
@@ -1360,6 +1378,7 @@ fn write_u64<W: Write>(out: &mut W, mut value: u64) -> std::io::Result<()> {
 fn emit_block_changes<W: Write>(
     out: &mut W,
     changes: &[(u64, u64, RenderedValue)],
+    payloads: &[u8],
     vars: &[Option<VcdVar>],
     real_endianness: RealEndianess,
     dumpvars_state: &mut u8,
@@ -1384,33 +1403,58 @@ fn emit_block_changes<W: Write>(
             *current_time = Some(*time);
         }
         if let Some(Some(var)) = vars.get(*id as usize) {
-            value.write(out, var, real_endianness)?;
+            value.write(out, payloads, var, real_endianness)?;
         }
     }
     Ok(())
 }
 
-/// An owned value change, decoupled from the block's borrowed buffers.
+/// A value change decoupled from the block's borrowed buffers. This is a
+/// `Copy`, `Drop`-free descriptor: the variable-length payloads (`VarLen`,
+/// `Vector`) live in a reused arena (`payloads`) and are referenced by a
+/// `[start, len)` byte range, so moving/discarding a descriptor costs nothing
+/// and clearing a block's change list frees no per-change allocation.
+#[derive(Clone, Copy)]
 enum RenderedValue {
     Bit(u8),
     Real([u8; 8]),
-    VarLen(Vec<u8>),
-    Vector(Vec<u8>),
+    VarLen { start: u32, len: u32 },
+    Vector { start: u32, len: u32 },
 }
 
 impl RenderedValue {
-    fn from_value(value: &Value) -> Self {
+    /// Renders `value` into a descriptor, appending any variable-length bytes
+    /// to the shared `payloads` arena. The arena is append-only and never
+    /// reordered, so the recorded range stays valid until the arena is cleared
+    /// for the next block.
+    fn from_value(value: &Value, payloads: &mut Vec<u8>) -> Self {
         match value {
             Value::Bit(bit) => RenderedValue::Bit(*bit),
             Value::Real(bytes) => RenderedValue::Real(*bytes),
-            Value::VarLen(data) => RenderedValue::VarLen(data.to_vec()),
-            Value::Packed { .. } | Value::Ascii(_) => RenderedValue::Vector(value.to_ascii()),
+            Value::VarLen(data) => {
+                let start = payloads.len() as u32;
+                payloads.extend_from_slice(data);
+                RenderedValue::VarLen {
+                    start,
+                    len: data.len() as u32,
+                }
+            }
+            Value::Packed { .. } | Value::Ascii(_) => {
+                let start = payloads.len() as u32;
+                let ascii = value.to_ascii();
+                payloads.extend_from_slice(&ascii);
+                RenderedValue::Vector {
+                    start,
+                    len: ascii.len() as u32,
+                }
+            }
         }
     }
 
     fn write<W: Write>(
         &self,
         out: &mut W,
+        payloads: &[u8],
         var: &VcdVar,
         real_endianness: RealEndianess,
     ) -> std::io::Result<()> {
@@ -1427,16 +1471,16 @@ impl RenderedValue {
                 out.write_all(var.code.as_bytes())?;
                 out.write_all(b"\n")
             }
-            RenderedValue::VarLen(data) => {
+            RenderedValue::VarLen { start, len } => {
                 out.write_all(b"s")?;
-                out.write_all(data)?;
+                out.write_all(&payloads[*start as usize..(*start + *len) as usize])?;
                 out.write_all(b" ")?;
                 out.write_all(var.code.as_bytes())?;
                 out.write_all(b"\n")
             }
-            RenderedValue::Vector(ascii) => {
+            RenderedValue::Vector { start, len } => {
                 out.write_all(if var.is_port { b"p" } else { b"b" })?;
-                out.write_all(ascii)?;
+                out.write_all(&payloads[*start as usize..(*start + *len) as usize])?;
                 out.write_all(b" ")?;
                 out.write_all(var.code.as_bytes())?;
                 out.write_all(b"\n")
