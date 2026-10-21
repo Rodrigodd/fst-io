@@ -1150,6 +1150,16 @@ fn decode_block_changes(
     let positions = block.read_positions(&head, &tail)?;
     let times = block.read_time_table(&tail)?;
 
+    // The time table is strictly increasing, so the in-range window
+    // `[start, end]` maps to a contiguous `time_index` range `[lo, hi)`, found
+    // once per block by binary search. The collect loop then filters each
+    // change with a pure integer compare instead of a per-change random-access
+    // gather into `times` (that gather was the collect loop's single hottest
+    // instruction before this change).
+    let table_len = times.len();
+    let lo = times.partition_point(|&t| t < start);
+    let hi = times.partition_point(|&t| t <= end);
+
     // Collect in-range changes keyed by `time_index` (field 0 holds the index,
     // not the resolved time yet). Each variable's run is already time-ordered;
     // the runs are concatenated here and ordered globally below.
@@ -1157,13 +1167,15 @@ fn decode_block_changes(
         let waves = block.read_waves(&head, &positions, id, lengths[geometry_index])?;
         for change in waves.iter() {
             let (time_index, value) = change?;
-            let time = times
-                .get(time_index as usize)
-                .copied()
-                .ok_or_else(|| invalid_data("time index out of range"))?;
+            // Preserve the reference's hard error for a time index past the
+            // table (a malformed block), as a cheap register compare.
+            if time_index as usize >= table_len {
+                return Err(invalid_data("time index out of range"));
+            }
             // Pre-`start` changes were already folded into the baseline by the
-            // serial prelude; here they are simply skipped.
-            if time < start || time > end {
+            // serial prelude; here they are simply skipped. The window bounds
+            // replace the old `times[time_index]` load + compare.
+            if (time_index as usize) < lo || time_index as usize >= hi {
                 continue;
             }
             changes.push((
