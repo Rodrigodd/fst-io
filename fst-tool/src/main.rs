@@ -959,6 +959,7 @@ fn write_vcd_value_changes<W: Write>(
                             job.scratch,
                             job.payloads,
                             job.offsets,
+                            job.framed,
                             ids,
                             lengths,
                             vars,
@@ -993,7 +994,8 @@ fn write_vcd_value_changes<W: Write>(
                                     changes: Vec<Change>,
                                     scratch: Vec<Change>,
                                     payloads: Vec<u8>,
-                                    offsets: Vec<u32>|
+                                    offsets: Vec<u32>,
+                                    framed: Vec<u8>|
                  -> bool {
                     let _ = work_tx.send(Job {
                         seq,
@@ -1002,6 +1004,7 @@ fn write_vcd_value_changes<W: Write>(
                         scratch,
                         payloads,
                         offsets,
+                        framed,
                     });
                     seq += 1;
                     true
@@ -1020,6 +1023,7 @@ fn write_vcd_value_changes<W: Write>(
                         bundle.scratch,
                         bundle.payloads,
                         bundle.offsets,
+                        bundle.framed,
                     ) {
                         return Ok(());
                     }
@@ -1042,6 +1046,7 @@ fn write_vcd_value_changes<W: Write>(
                             bundle.scratch,
                             bundle.payloads,
                             bundle.offsets,
+                            bundle.framed,
                         ) {
                             break;
                         }
@@ -1083,7 +1088,7 @@ fn write_vcd_value_changes<W: Write>(
                     emit_block_changes(
                         out,
                         &decoded.changes,
-                        &decoded.payloads,
+                        &decoded.framed,
                         &mut line,
                         &mut dumpvars_state,
                         &mut current_time,
@@ -1097,6 +1102,7 @@ fn write_vcd_value_changes<W: Write>(
                         scratch: decoded.scratch,
                         payloads: decoded.payloads,
                         offsets: decoded.offsets,
+                        framed: decoded.framed,
                     });
                 }
             }
@@ -1133,6 +1139,7 @@ struct Job {
     scratch: Vec<Change>,
     payloads: Vec<u8>,
     offsets: Vec<u32>,
+    framed: Vec<u8>,
 }
 
 /// A worker's decoded output: the block's in-range changes, time-sorted, plus
@@ -1145,6 +1152,7 @@ struct Decoded {
     scratch: Vec<Change>,
     payloads: Vec<u8>,
     offsets: Vec<u32>,
+    framed: Vec<u8>,
 }
 
 /// Decodes one in-range block into its time-sorted change list. This is the
@@ -1160,6 +1168,7 @@ fn decode_block_changes(
     mut scratch: Vec<Change>,
     mut payloads: Vec<u8>,
     mut offsets: Vec<u32>,
+    mut framed: Vec<u8>,
     ids: &[u64],
     lengths: &[VariableLength],
     vars: &[Option<VcdVar>],
@@ -1232,19 +1241,39 @@ fn decode_block_changes(
     for i in 0..bucket_count {
         offsets[i + 1] += offsets[i];
     }
-    // Scatter into `scratch`, resolving each `time_index` to its real time.
-    // Slots are pre-filled then overwritten in sorted position; the tuples are
-    // trivially copyable, so this is a plain memory move.
+    // Scatter the per-change rendered ranges into time-sorted order, then
+    // build the block's final layout: all of a block's rendered change bytes
+    // copied CONTIGUOUSLY into `framed` in sorted order, and one `Change`
+    // entry `(time, frame_start, frame_len)` PER DISTINCT TIME (a time-group
+    // span), not per change. This does the heavy byte copy on the parallel
+    // decode thread and shrinks the serial writer's loop from per-change to
+    // per-time-group, each emitted with a single `write_all` of a contiguous
+    // span. `scratch` holds the sorted `(time, rstart, rlen)` temporarily.
     scratch.clear();
     scratch.resize_with(n, || (0, 0, 0));
-    for &(time_index, payload_start, payload_len) in &changes {
+    for &(time_index, rstart, rlen) in &changes {
         let slot = &mut offsets[time_index as usize];
-        scratch[*slot as usize] = (times[time_index as usize], payload_start, payload_len);
+        scratch[*slot as usize] = (times[time_index as usize], rstart, rlen);
         *slot += 1;
     }
-    // `scratch` now holds the sorted, time-resolved changes; swap so `changes`
-    // carries them out and the emptied buffer returns to the pool as scratch.
-    std::mem::swap(&mut changes, &mut scratch);
+    framed.clear();
+    changes.clear();
+    let mut group_time = u64::MAX;
+    let mut group_start = 0u32;
+    for &(time, rstart, rlen) in scratch.iter() {
+        if time != group_time {
+            // Close the previous group and open a new one at this time.
+            if group_time != u64::MAX {
+                changes.push((group_time, group_start, framed.len() as u32 - group_start));
+            }
+            group_time = time;
+            group_start = framed.len() as u32;
+        }
+        framed.extend_from_slice(&payloads[rstart as usize..(rstart + rlen) as usize]);
+    }
+    if group_time != u64::MAX {
+        changes.push((group_time, group_start, framed.len() as u32 - group_start));
+    }
 
     // Recover the section's backing bytes so the writer can recycle them.
     let bytes = block.data.into_inner();
@@ -1255,6 +1284,7 @@ fn decode_block_changes(
         scratch,
         payloads,
         offsets,
+        framed,
     })
 }
 
@@ -1311,10 +1341,16 @@ fn rebuffer(
 /// dispatcher could otherwise block forever in `acquire` (no permits are ever
 /// released again), which would hang the scope that joins every thread.
 /// Shutting down makes every current and future `acquire` return immediately.
-/// One value change, time-sorted within a block: the resolved `time` plus the
-/// `[start, len)` byte range of its COMPLETE pre-rendered VCD line (value +
-/// code + `\n`) in the block's payload arena. The line is rendered on the
-/// decode thread, so the writer only frames `#time` and copies the range.
+/// One TIME-GROUP span, time-sorted within a block: `(time, start, len)` where
+/// `[start, start+len)` is the concatenated, pre-rendered VCD output of every
+/// change at `time`, laid out contiguously in the block's `framed` buffer by
+/// the parallel decoder. The serial writer emits one `#time` line per entry
+/// and one `write_all` of the span — so its loop runs per distinct time, not
+/// per change, and the byte copy already happened off the critical path.
+///
+/// During the counting sort the first field transiently holds the `time_index`
+/// and the span fields hold the per-change `payloads` range — see
+/// `decode_block_changes`.
 type Change = (u64, u32, u32);
 
 /// The two reusable buffers that circulate with one in-flight block: the raw
@@ -1337,6 +1373,9 @@ struct Buffers {
     /// Counting-sort bucket offsets (`bucket_count + 1` entries), recycled so
     /// the sort allocates and zero-fills no fresh vector per block.
     offsets: Vec<u32>,
+    /// The block's rendered change bytes, concatenated in time-sorted order.
+    /// The writer copies one contiguous time-group span per `#time`.
+    framed: Vec<u8>,
 }
 
 /// A bounded pool of reusable [`Buffers`], built on the standard library only
@@ -1423,17 +1462,20 @@ fn push_u64(out: &mut Vec<u8>, mut value: u64) {
     out.extend_from_slice(&buf[i..]);
 }
 
-/// Emits one block's already-sorted changes, carrying the `$dumpvars` state
-/// machine and the last-written `#time` across block boundaries so the whole
-/// stream reads as one time-ordered dump.
+/// Emits one block's already-sorted TIME-GROUP spans, carrying the `$dumpvars`
+/// state machine and the last-written `#time` across block boundaries so the
+/// whole stream reads as one time-ordered dump.
 ///
-/// The block is composed into the reusable `line` buffer (framing + the
-/// pre-rendered change bytes) and flushed in a single `write_all`, instead of
-/// one write per change and per `#time` marker.
+/// Each entry is one distinct time whose changes were already rendered AND
+/// concatenated in sorted order into `framed` by the parallel decoder (see
+/// `decode_block_changes`); the writer only emits the `#time`/`$dumpvars`
+/// framing and copies one contiguous span per time. The block is composed into
+/// `line` and flushed in one `write_all`. A zero-length span (a time whose
+/// changes are all on undeclared variables) still advances `#time`.
 fn emit_block_changes<W: Write>(
     out: &mut W,
     changes: &[Change],
-    payloads: &[u8],
+    framed: &[u8],
     line: &mut Vec<u8>,
     dumpvars_state: &mut u8,
     current_time: &mut Option<u64>,
@@ -1457,10 +1499,9 @@ fn emit_block_changes<W: Write>(
             }
             *current_time = Some(time);
         }
-        // The change's complete VCD line was rendered on the decode thread; a
-        // change on an undeclared variable has a zero-length range and emits
-        // nothing but still advanced `#time` above.
-        line.extend_from_slice(&payloads[start as usize..(start + len) as usize]);
+        if len != 0 {
+            line.extend_from_slice(&framed[start as usize..(start + len) as usize]);
+        }
     }
     out.write_all(line)
 }
