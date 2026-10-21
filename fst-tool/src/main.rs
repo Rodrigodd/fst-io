@@ -1075,8 +1075,8 @@ fn write_vcd_value_changes<W: Write>(
             std::collections::BTreeMap::new();
         let mut dumpvars_state = initial_dumpvars_state;
         let mut current_time = initial_time;
-        // Reused across blocks: the writer composes each block into this buffer
-        // and flushes it in one `write_all`.
+        // Reusable per-block output buffer: a block's framing + pre-rendered
+        // change bytes are composed here, then flushed in one `write_all`.
         let mut line: Vec<u8> = Vec::new();
 
         let mut write_loop = || -> std::io::Result<()> {
@@ -1185,43 +1185,42 @@ fn decode_block_changes(
     let times = block.read_time_table(&tail)?;
 
     // The time table is strictly increasing, so the in-range window
-    // `[start, end]` maps to a contiguous `time_index` range `[lo, hi)`, found
-    // once per block by binary search. The collect loop then filters each
-    // change with a pure integer compare instead of a per-change random-access
-    // gather into `times` (that gather was the collect loop's single hottest
-    // instruction before this change).
-    let table_len = times.len();
-    let lo = times.partition_point(|&t| t < start);
-    let hi = times.partition_point(|&t| t <= end);
+    // `[start, end]` maps to a contiguous `time_index` range `[lo, hi)` found
+    // once by binary search. Filtering each change against these integer
+    // bounds avoids a random-access gather into `times` per change — the
+    // collect loop's single hottest instruction before this change.
+    let lo = times.partition_point(|&t| t < start) as u64;
+    let hi = times.partition_point(|&t| t <= end) as u64; // exclusive upper bound
+    let table_len = times.len() as u64;
 
     // Collect in-range changes keyed by `time_index` (field 0 holds the index,
-    // not the resolved time yet). The complete VCD line is rendered here, on
-    // the decode thread, into the payload arena; the change records only its
-    // `[start, len)` range. A change on an undeclared variable renders no bytes
-    // (`len == 0`) but is still recorded, so the writer still emits its `#time`.
-    // Each variable's run is already time-ordered; the runs are concatenated
-    // here and ordered globally below.
+    // not the resolved time yet), each PRE-RENDERED into the payload arena as
+    // its full VCD line (value + code + '\n'). Each variable's run is already
+    // time-ordered; the runs are concatenated here and ordered globally below.
     for (geometry_index, &id) in ids.iter().enumerate() {
+        // The identifier/port info for this variable, resolved once per run
+        // (not per change). A variable with no entry emits no value text, but
+        // its changes are still kept so the writer sees their `#time`.
+        let var = vars.get(id as usize).and_then(Option::as_ref);
         let waves = block.read_waves(&head, &positions, id, lengths[geometry_index])?;
         for change in waves.iter() {
             let (time_index, value) = change?;
-            // Preserve the reference's hard error for a time index past the
-            // table (a malformed block), as a cheap register compare.
-            if time_index as usize >= table_len {
+            // Preserve the original hard error for an index past the table
+            // (malformed input), rather than silently dropping it.
+            if time_index >= table_len {
                 return Err(invalid_data("time index out of range"));
             }
             // Pre-`start` changes were already folded into the baseline by the
-            // serial prelude; here they are simply skipped. The window bounds
-            // replace the old `times[time_index]` load + compare.
-            if (time_index as usize) < lo || time_index as usize >= hi {
+            // serial prelude; here they are simply skipped.
+            if time_index < lo || time_index >= hi {
                 continue;
             }
-            let payload_start = payloads.len() as u32;
-            if let Some(Some(var)) = vars.get(id as usize) {
+            let rendered_start = payloads.len() as u32;
+            if let Some(var) = var {
                 render_change(&mut payloads, &value, var, real_endianness);
             }
-            let payload_len = payloads.len() as u32 - payload_start;
-            changes.push((time_index, payload_start, payload_len));
+            let rendered_len = payloads.len() as u32 - rendered_start;
+            changes.push((time_index, rendered_start, rendered_len));
         }
     }
 
@@ -1232,9 +1231,10 @@ fn decode_block_changes(
     let n = changes.len();
     let bucket_count = times.len();
     // Per-bucket start offsets via a prefix sum of the counts. The buffer is
-    // recycled through the pool, so this allocates nothing per block.
+    // recycled: cleared then zero-filled to the current bucket count, so no
+    // fresh allocation + page-zeroing happens per block.
     offsets.clear();
-    offsets.resize(bucket_count + 1, 0);
+    offsets.resize(bucket_count + 1, 0u32);
     for &(time_index, _, _) in &changes {
         offsets[time_index as usize + 1] += 1;
     }
@@ -1366,15 +1366,20 @@ struct Buffers {
     /// Scratch scatter target for the counting sort, recycled alongside the
     /// rest so the sort allocates nothing per block.
     scratch: Vec<Change>,
-    /// Arena holding one block's variable-length payload bytes, referenced by
-    /// `[start, len)` ranges in the change descriptors. Recycled per block so
-    /// the per-change `Vec<u8>` allocations are gone.
+    /// Per-block payload arena: the concatenated bytes of every vector/varlen
+    /// change in the block. `RenderedValue` records ranges into this instead
+    /// of owning a `Vec` per change, so decoding a block appends to one
+    /// growable buffer (reused across blocks) rather than doing one heap
+    /// allocation per change — and clearing a block frees nothing.
     payloads: Vec<u8>,
-    /// Counting-sort bucket offsets (`bucket_count + 1` entries), recycled so
-    /// the sort allocates and zero-fills no fresh vector per block.
+    /// Counting-sort bucket offsets (one per time-table entry + 1), recycled
+    /// so the sort does not allocate + zero a fresh `Vec` per block — that
+    /// per-block allocation showed up as kernel page-zeroing in the profile.
     offsets: Vec<u32>,
-    /// The block's rendered change bytes, concatenated in time-sorted order.
-    /// The writer copies one contiguous time-group span per `#time`.
+    /// The block's rendered change bytes laid out CONTIGUOUSLY in time-sorted
+    /// order. The writer copies time-group spans straight out of here, so the
+    /// heavy sorted copy happens on the parallel decode thread, not the serial
+    /// writer. `changes` indexes into this (not `payloads`).
     framed: Vec<u8>,
 }
 
@@ -1445,23 +1450,6 @@ impl BufferPool {
     }
 }
 
-/// Appends a `u64` as decimal ASCII to `out`, without the `std::fmt`
-/// machinery. The largest `u64` is 20 digits, so a 20-byte scratch buffer
-/// always suffices.
-fn push_u64(out: &mut Vec<u8>, mut value: u64) {
-    let mut buf = [0u8; 20];
-    let mut i = buf.len();
-    loop {
-        i -= 1;
-        buf[i] = b'0' + (value % 10) as u8;
-        value /= 10;
-        if value == 0 {
-            break;
-        }
-    }
-    out.extend_from_slice(&buf[i..]);
-}
-
 /// Emits one block's already-sorted TIME-GROUP spans, carrying the `$dumpvars`
 /// state machine and the last-written `#time` across block boundaries so the
 /// whole stream reads as one time-ordered dump.
@@ -1504,6 +1492,45 @@ fn emit_block_changes<W: Write>(
         }
     }
     out.write_all(line)
+}
+
+/// Two-digit ASCII pairs "00".."99", for formatting two decimal digits per
+/// division instead of one. Built at compile time.
+static DEC_PAIRS: [[u8; 2]; 100] = {
+    let mut t = [[0u8; 2]; 100];
+    let mut i = 0usize;
+    while i < 100 {
+        t[i] = [b'0' + (i / 10) as u8, b'0' + (i % 10) as u8];
+        i += 1;
+    }
+    t
+};
+
+/// Appends `value`'s base-10 ASCII digits to `buf`. Formats two digits per
+/// iteration via [`DEC_PAIRS`], halving the `div`/`rem` chain — the writer's
+/// dominant cost is formatting the large `#time` timestamps. The largest
+/// `u64` is 20 digits, so a 20-byte scratch buffer always suffices.
+fn push_u64(buf: &mut Vec<u8>, mut value: u64) {
+    let mut tmp = [0u8; 20];
+    let mut i = tmp.len();
+    while value >= 100 {
+        let pair = DEC_PAIRS[(value % 100) as usize];
+        value /= 100;
+        i -= 2;
+        tmp[i] = pair[0];
+        tmp[i + 1] = pair[1];
+    }
+    // Final 1 or 2 digits.
+    if value >= 10 {
+        let pair = DEC_PAIRS[value as usize];
+        i -= 2;
+        tmp[i] = pair[0];
+        tmp[i + 1] = pair[1];
+    } else {
+        i -= 1;
+        tmp[i] = b'0' + value as u8;
+    }
+    buf.extend_from_slice(&tmp[i..]);
 }
 
 /// Maps each byte to its 8 bits as ASCII `'0'`/`'1'`, most-significant bit
