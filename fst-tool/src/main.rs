@@ -1421,6 +1421,23 @@ fn emit_block_changes<W: Write>(
     Ok(())
 }
 
+/// Maps each byte to its 8 bits as ASCII `'0'`/`'1'`, most-significant bit
+/// first. Used to expand packed multi-bit values a whole byte at a time.
+/// Built at compile time, so it costs nothing at runtime.
+static BIT_EXPAND: [[u8; 8]; 256] = {
+    let mut table = [[0u8; 8]; 256];
+    let mut byte = 0usize;
+    while byte < 256 {
+        let mut bit = 0usize;
+        while bit < 8 {
+            table[byte][bit] = b'0' | ((byte >> (7 - bit)) & 1) as u8;
+            bit += 1;
+        }
+        byte += 1;
+    }
+    table
+};
+
 /// A value change decoupled from the block's borrowed buffers. This is a
 /// `Copy`, `Drop`-free descriptor: the variable-length payloads (`VarLen`,
 /// `Vector`) live in a reused arena (`payloads`) and are referenced by a
@@ -1451,13 +1468,33 @@ impl RenderedValue {
                     len: data.len() as u32,
                 }
             }
-            Value::Packed { .. } | Value::Ascii(_) => {
+            Value::Packed { data, bits } => {
                 let start = payloads.len() as u32;
-                let ascii = value.to_ascii();
-                payloads.extend_from_slice(&ascii);
+                // Expand packed bits (MSB-first) to one ASCII '0'/'1' per bit,
+                // straight into the arena. The 256-entry table turns each whole
+                // input byte into its 8 ASCII chars with one table load + copy,
+                // instead of a per-bit shift with two divisions (`i/8`, `i%8`).
+                let bits = *bits;
+                let full = bits / 8;
+                payloads.reserve(bits);
+                for &byte in &data[..full] {
+                    payloads.extend_from_slice(&BIT_EXPAND[byte as usize]);
+                }
+                let rem = bits % 8;
+                if rem != 0 {
+                    payloads.extend_from_slice(&BIT_EXPAND[data[full] as usize][..rem]);
+                }
                 RenderedValue::Vector {
                     start,
-                    len: ascii.len() as u32,
+                    len: bits as u32,
+                }
+            }
+            Value::Ascii(data) => {
+                let start = payloads.len() as u32;
+                payloads.extend_from_slice(data);
+                RenderedValue::Vector {
+                    start,
+                    len: data.len() as u32,
                 }
             }
         }
