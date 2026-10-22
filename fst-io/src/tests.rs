@@ -341,6 +341,9 @@ fn svarint_roundtrip() {
 }
 
 #[test]
+// `0 << 1 | 1` keeps the `value << shift | flag` layout aligned with the other
+// encoded fields.
+#[allow(clippy::identity_op)]
 fn positions_alias2_spec_example() {
     // 0 0 100 0 -3 0 200 350 -3
     let mut data = varint(2 << 1);
@@ -435,6 +438,8 @@ fn waves(data: Vec<u8>, length: VariableLength) -> Vec<(u64, Vec<u8>)> {
 }
 
 #[test]
+// `0 << 2` keeps the `delta << 2 | kind << 1 | bit` layout explicit.
+#[allow(clippy::identity_op)]
 fn one_bit_waves() {
     let mut data = Vec::new();
     data.extend(varint(0 << 2 | 1 << 1)); // 1 at 0

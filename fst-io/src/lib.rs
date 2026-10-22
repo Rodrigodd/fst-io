@@ -245,6 +245,11 @@ impl<R> Section<R> {
         self.len
     }
 
+    /// Whether the section carries no data beyond its block type and length.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub fn block_type(&self) -> Option<BlockType> {
         match self.block_type {
             0 => Some(BlockType::Header),
@@ -1677,6 +1682,9 @@ impl<R: Read + Seek> SectionIterator<Take<R>> {
     /// Returns the next section, or `None` at end of file.
     ///
     /// Any data left unread in the previous section is skipped first.
+    // Not `Iterator::next`: this is fallible and each item borrows the iterator,
+    // so the trait's signature cannot express it.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> std::io::Result<Option<Section<&mut Take<R>>>> {
         skip_remaining(&mut self.reader)?;
         let reader = self.reader.get_mut();
