@@ -25,6 +25,10 @@ enum Command {
     Info {
         /// The FST file to read.
         input: PathBuf,
+        /// Print the header: timescale, time range, writer, date and counts.
+        /// Printed before the hierarchy when combined with --hier.
+        #[arg(long)]
+        header: bool,
         /// Print the full hierarchy: scopes and variables.
         #[arg(long)]
         hier: bool,
@@ -85,7 +89,11 @@ enum Command {
 fn main() -> std::io::Result<()> {
     match Cli::parse().command {
         Command::Dump { input } => dump(&input),
-        Command::Info { hier: false, .. } => {
+        Command::Info {
+            header: false,
+            hier: false,
+            ..
+        } => {
             // Like readelf and objdump, ask for something to be printed.
             Cli::command()
                 .find_subcommand_mut("info")
@@ -94,8 +102,12 @@ fn main() -> std::io::Result<()> {
             std::process::exit(2);
         }
         Command::Info {
-            input, flat, names, ..
-        } => info_hierarchy(&input, flat, names),
+            input,
+            header,
+            hier,
+            flat,
+            names,
+        } => info(&input, header, hier, flat, names),
         Command::Vcd {
             input,
             output,
@@ -256,6 +268,48 @@ fn push_column(line: &mut String, text: &str, width: usize) {
     if width > 0 {
         line.push_str(&format!("{text:<width$} "));
     }
+}
+
+/// Prints the requested parts of a file: the header, the hierarchy, or both
+/// (header first). At least one of `header`/`hier` is set by the caller.
+fn info(input: &Path, header: bool, hier: bool, flat: bool, names: bool) -> std::io::Result<()> {
+    if header {
+        info_header(input)?;
+    }
+    if hier {
+        info_hierarchy(input, flat, names)?;
+    }
+    Ok(())
+}
+
+/// Prints the header as `key: value` lines: timescale (as a VCD unit label),
+/// time range, writer, date, and the scope/variable/block counts.
+fn info_header(input: &Path) -> std::io::Result<()> {
+    let mut iterator = SectionIterator::new(BufReader::new(std::fs::File::open(input)?));
+    let mut header = None;
+    while let Some(section) = iterator.next()? {
+        if matches!(section.block_type(), Some(BlockType::Header)) {
+            header = Some(section.read_header()?);
+            break;
+        }
+    }
+    let header = header.ok_or_else(|| invalid_data("file has no header block"))?;
+
+    let mut out = BufWriter::new(std::io::stdout().lock());
+    // asctime() leaves a trailing newline inside the date field; trim it so the
+    // date stays on its own `key: value` line.
+    let date = c_string(&header.date);
+    let date = date.trim_end();
+    writeln!(out, "timescale: {}", timescale_label(header.timescale))?;
+    writeln!(out, "start_time: {}", header.start_time)?;
+    writeln!(out, "end_time: {}", header.end_time)?;
+    writeln!(out, "writer: {}", c_string(&header.writer))?;
+    writeln!(out, "date: {date}")?;
+    writeln!(out, "scopes: {}", header.num_scopes)?;
+    writeln!(out, "variables: {}", header.num_hierarchy_vars)?;
+    writeln!(out, "distinct_variables: {}", header.num_vars)?;
+    writeln!(out, "value_change_blocks: {}", header.num_vc_blocks)?;
+    out.flush()
 }
 
 /// Prints the hierarchy of the file, as an indented tree or one variable per
