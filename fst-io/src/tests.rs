@@ -709,3 +709,101 @@ fn copy_sections() {
     assert!(iterator.next().unwrap().is_some()); // blackout, not copied
     assert_eq!(copy, file[..copy.len()]);
 }
+
+/// Wraps `inner` as a whole-file gzip wrapper, claiming `uncompressed_len`.
+///
+/// The claimed length is what [`FstInput`] reads to choose memory vs temp
+/// storage; a test can overstate it to force the temp-file path.
+fn gzip_wrapper(inner: &[u8], uncompressed_len: u64) -> Vec<u8> {
+    let compressed = gzip(inner);
+    let mut body = Vec::new();
+    body.extend_from_slice(&uncompressed_len.to_be_bytes());
+    body.extend_from_slice(&compressed);
+    section(BlockType::GzippedWrapper as u8, &body)
+}
+
+fn write_temp(bytes: &[u8], tag: &str) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!("fst-io-test-{}-{}.fst", std::process::id(), tag));
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+fn sample_inner_file() -> Vec<u8> {
+    let lengths = [0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0xAC, 0x02];
+    let mut file = geometry(&lengths, 4);
+    file.extend(section(BlockType::Blackout as u8, &[1, 2, 3]));
+    file
+}
+
+#[test]
+fn unwrapped_input_is_read_in_place() {
+    let inner = sample_inner_file();
+    let path = write_temp(&inner, "plain");
+    let input = FstInput::open_path(&path).unwrap();
+    assert!(!input.is_wrapped());
+    let mut read = Vec::new();
+    input.open().unwrap().read_to_end(&mut read).unwrap();
+    assert_eq!(read, inner);
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn gzip_wrapper_decompresses_to_the_inner_file() {
+    let inner = sample_inner_file();
+    let path = write_temp(&gzip_wrapper(&inner, inner.len() as u64), "memory");
+    let input = FstInput::open_path(&path).unwrap();
+    assert!(input.is_wrapped());
+    let mut read = Vec::new();
+    input.open().unwrap().read_to_end(&mut read).unwrap();
+    assert_eq!(read, inner);
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn large_gzip_wrapper_uses_a_temp_file() {
+    let inner = sample_inner_file();
+    let claimed = WRAPPER_MEMORY_LIMIT + 1;
+    let path = write_temp(&gzip_wrapper(&inner, claimed), "temp");
+    let input = FstInput::open_path(&path).unwrap();
+    assert!(matches!(input, FstInput::Temp(_)));
+    let mut read = Vec::new();
+    input.open().unwrap().read_to_end(&mut read).unwrap();
+    assert_eq!(read, inner);
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn wrapped_and_plain_iterate_the_same_sections() {
+    let inner = sample_inner_file();
+    let plain = write_temp(&inner, "eq-plain");
+    let wrapped = write_temp(&gzip_wrapper(&inner, inner.len() as u64), "eq-wrapped");
+
+    let kinds = |path: &Path| -> Vec<u8> {
+        let mut iterator = SectionIterator::new(FstInput::open_path(path).unwrap().open().unwrap());
+        let mut kinds = Vec::new();
+        while let Some(section) = iterator.next().unwrap() {
+            kinds.push(section.block_type);
+        }
+        kinds
+    };
+
+    assert_eq!(kinds(&plain), kinds(&wrapped));
+    std::fs::remove_file(&plain).unwrap();
+    std::fs::remove_file(&wrapped).unwrap();
+}
+
+#[test]
+fn temp_file_is_removed_on_drop() {
+    let inner = sample_inner_file();
+    let path = write_temp(&gzip_wrapper(&inner, WRAPPER_MEMORY_LIMIT + 1), "drop");
+    let input = FstInput::open_path(&path).unwrap();
+    let FstInput::Temp(ref temp) = input else {
+        panic!("expected temp-file input");
+    };
+    let temp_path = temp.path().to_path_buf();
+    assert!(temp_path.exists());
+    drop(input);
+    assert!(!temp_path.exists());
+    std::fs::remove_file(&path).unwrap();
+}

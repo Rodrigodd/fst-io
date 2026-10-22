@@ -1,4 +1,7 @@
-use std::io::{BufRead, Cursor, Read, Seek, Take, Write};
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Take, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use flate2::read::{GzDecoder, ZlibDecoder};
 
@@ -1515,6 +1518,136 @@ fn to_usize(value: u64) -> std::io::Result<usize> {
 fn invalid_data(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
 }
+
+/// Decompressed FST payloads at or above this size are staged in a temp file
+/// instead of memory, bounding peak RAM for large wrapped dumps.
+const WRAPPER_MEMORY_LIMIT: u64 = 256 * 1024 * 1024;
+
+/// A seekable reader over an FST file's bytes, whichever form the input took.
+///
+/// A plain file reads straight from disk; a [gzip-wrapped](BlockType::GzippedWrapper)
+/// file is decompressed once by [`FstInput`] and read back from memory (small)
+/// or a temp file (large). All three are [`Read`] + [`Seek`], so the section
+/// readers do not know or care which they were handed.
+pub enum FstSource {
+    File(BufReader<File>),
+    Memory(Cursor<Arc<[u8]>>),
+    Temp(BufReader<File>),
+}
+
+impl Read for FstSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            FstSource::File(r) | FstSource::Temp(r) => r.read(buf),
+            FstSource::Memory(r) => r.read(buf),
+        }
+    }
+}
+
+impl Seek for FstSource {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        match self {
+            FstSource::File(r) | FstSource::Temp(r) => r.seek(pos),
+            FstSource::Memory(r) => r.seek(pos),
+        }
+    }
+}
+
+/// A resolved FST input that opens fresh seekable readers over the file's
+/// contents, transparently decompressing a whole-file gzip wrapper.
+///
+/// FST readers seek, and the multi-pass tools reopen their input, so the
+/// wrapper is decompressed exactly once here: the inner FST is staged in memory
+/// or a temp file, and each [`open`](FstInput::open) hands out a fresh
+/// [`FstSource`] over it. An unwrapped file is reopened from its path, so the
+/// cost matches reading it directly.
+pub enum FstInput {
+    Plain(PathBuf),
+    Memory(Arc<[u8]>),
+    Temp(TempFile),
+}
+
+impl FstInput {
+    /// Resolves `path`, decompressing it once if it is a gzip wrapper.
+    ///
+    /// Detection reads only the leading block-type byte; an unwrapped file is
+    /// recorded by path and never buffered.
+    pub fn open_path(path: &Path) -> std::io::Result<FstInput> {
+        let mut head = [0u8; 1];
+        let read = File::open(path)?.read(&mut head)?;
+        if read == 1 && head[0] == BlockType::GzippedWrapper as u8 {
+            Self::unwrap(path)
+        } else {
+            Ok(FstInput::Plain(path.to_path_buf()))
+        }
+    }
+
+    fn unwrap(path: &Path) -> std::io::Result<FstInput> {
+        let mut file = BufReader::new(File::open(path)?);
+        let mut prelude = [0u8; 17];
+        file.read_exact(&mut prelude)?;
+
+        let uncompressed_len = u64::from_be_bytes(prelude[9..17].try_into().unwrap());
+
+        if uncompressed_len < WRAPPER_MEMORY_LIMIT {
+            let mut buf = Vec::with_capacity(to_usize(uncompressed_len).unwrap_or(0));
+            GzDecoder::new(file).read_to_end(&mut buf)?;
+            Ok(FstInput::Memory(Arc::from(buf.into_boxed_slice())))
+        } else {
+            let temp = TempFile::create()?;
+            let mut out = BufWriter::new(File::create(temp.path())?);
+            std::io::copy(&mut GzDecoder::new(file), &mut out)?;
+            out.flush()?;
+            drop(out);
+            Ok(FstInput::Temp(temp))
+        }
+    }
+
+    /// Opens a fresh seekable reader over the (possibly decompressed) FST bytes.
+    pub fn open(&self) -> std::io::Result<FstSource> {
+        match self {
+            FstInput::Plain(path) => Ok(FstSource::File(BufReader::new(File::open(path)?))),
+            FstInput::Memory(bytes) => Ok(FstSource::Memory(Cursor::new(Arc::clone(bytes)))),
+            FstInput::Temp(temp) => Ok(FstSource::Temp(BufReader::new(File::open(temp.path())?))),
+        }
+    }
+
+    /// Whether the input was a gzip wrapper that had to be decompressed.
+    pub fn is_wrapped(&self) -> bool {
+        !matches!(self, FstInput::Plain(_))
+    }
+}
+
+/// A temp file that deletes itself when dropped.
+pub struct TempFile {
+    path: PathBuf,
+}
+
+impl TempFile {
+    fn create() -> std::io::Result<TempFile> {
+        let mut path = std::env::temp_dir();
+        let unique = format!(
+            "fst-io-{}-{}.fst",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        path.push(unique);
+        File::create(&path)?;
+        Ok(TempFile { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Skips the bytes left in `reader` up to its limit.
 fn skip_remaining<R: Seek>(reader: &mut Take<R>) -> std::io::Result<()> {

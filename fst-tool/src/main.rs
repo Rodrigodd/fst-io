@@ -17,6 +17,11 @@ enum Command {
     Dump {
         /// The FST file to read.
         input: PathBuf,
+        /// Decompress a gzip-wrapped file and dump the inner FST. Without it,
+        /// a wrapped file is reported and left untouched, since its block
+        /// structure is a single wrapper section.
+        #[arg(long)]
+        allow_compressed: bool,
     },
     /// Print information about a file.
     ///
@@ -83,12 +88,20 @@ enum Command {
         end_time: u64,
         /// The FST file to write.
         output: PathBuf,
+        /// Splice a gzip-wrapped file, writing an uncompressed FST. Without it,
+        /// a wrapped file is refused, since the output would not carry the
+        /// wrapper's compression.
+        #[arg(long)]
+        allow_compressed: bool,
     },
 }
 
 fn main() -> std::io::Result<()> {
     match Cli::parse().command {
-        Command::Dump { input } => dump(&input),
+        Command::Dump {
+            input,
+            allow_compressed,
+        } => dump(&input, allow_compressed),
         Command::Info {
             header: false,
             hier: false,
@@ -128,7 +141,8 @@ fn main() -> std::io::Result<()> {
             start_time,
             end_time,
             output,
-        } => splice(&input, start_time, end_time, &output),
+            allow_compressed,
+        } => splice(&input, start_time, end_time, &output, allow_compressed),
     }
 }
 
@@ -218,10 +232,10 @@ fn direction_label(direction: u8) -> String {
 
 /// Calls `f` for each entry of the hierarchy of the file, as they are decoded.
 fn for_each_hierarchy_entry(
-    input: &Path,
+    input: &FstInput,
     mut f: impl FnMut(HierarchyEntry) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    let mut iterator = SectionIterator::new(BufReader::new(std::fs::File::open(input)?));
+    let mut iterator = SectionIterator::new(input.open()?);
     while let Some(section) = iterator.next()? {
         if !matches!(
             section.block_type(),
@@ -273,19 +287,20 @@ fn push_column(line: &mut String, text: &str, width: usize) {
 /// Prints the requested parts of a file: the header, the hierarchy, or both
 /// (header first). At least one of `header`/`hier` is set by the caller.
 fn info(input: &Path, header: bool, hier: bool, flat: bool, names: bool) -> std::io::Result<()> {
+    let input = FstInput::open_path(input)?;
     if header {
-        info_header(input)?;
+        info_header(&input)?;
     }
     if hier {
-        info_hierarchy(input, flat, names)?;
+        info_hierarchy(&input, flat, names)?;
     }
     Ok(())
 }
 
 /// Prints the header as `key: value` lines: timescale (as a VCD unit label),
 /// time range, writer, date, and the scope/variable/block counts.
-fn info_header(input: &Path) -> std::io::Result<()> {
-    let mut iterator = SectionIterator::new(BufReader::new(std::fs::File::open(input)?));
+fn info_header(input: &FstInput) -> std::io::Result<()> {
+    let mut iterator = SectionIterator::new(input.open()?);
     let mut header = None;
     while let Some(section) = iterator.next()? {
         if matches!(section.block_type(), Some(BlockType::Header)) {
@@ -318,7 +333,7 @@ fn info_header(input: &Path) -> std::io::Result<()> {
 /// The hierarchy is read twice: first to find the width of each column, then
 /// to print it. Entries are decoded as they are printed, never all kept.
 /// With `names`, only the names are printed.
-fn info_hierarchy(input: &Path, flat: bool, names: bool) -> std::io::Result<()> {
+fn info_hierarchy(input: &FstInput, flat: bool, names: bool) -> std::io::Result<()> {
     let mut widths = Widths::default();
     if !names {
         for_each_hierarchy_entry(input, |entry| {
@@ -424,7 +439,13 @@ fn is_value_change(block_type: Option<BlockType>) -> bool {
     )
 }
 
-fn splice(input: &Path, start_time: u64, end_time: u64, output: &Path) -> std::io::Result<()> {
+fn splice(
+    input: &Path,
+    start_time: u64,
+    end_time: u64,
+    output: &Path,
+    allow_compressed: bool,
+) -> std::io::Result<()> {
     if start_time > end_time {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -432,7 +453,15 @@ fn splice(input: &Path, start_time: u64, end_time: u64, output: &Path) -> std::i
         ));
     }
 
-    let open = || -> std::io::Result<_> { Ok(BufReader::new(std::fs::File::open(input)?)) };
+    let input = FstInput::open_path(input)?;
+    if input.is_wrapped() && !allow_compressed {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "input is a gzip-wrapped FST; the output would be uncompressed. \
+             Pass --allow-compressed to splice it anyway",
+        ));
+    }
+    let open = || input.open();
 
     // The header comes first but needs to know which blocks are kept, so the
     // file is read twice. The first pass only reads the 24 fixed bytes of each
@@ -802,7 +831,8 @@ fn vcd(
         ));
     }
 
-    let open = || -> std::io::Result<_> { Ok(BufReader::new(std::fs::File::open(input)?)) };
+    let input = FstInput::open_path(input)?;
+    let open = || input.open();
 
     // First pass: read the header and geometry. The geometry comes after the
     // value change blocks, but the lengths are needed to decode them, so the
@@ -840,12 +870,12 @@ fn vcd(
     // and build the per-variable table indexed by variable id.
     let filter = SignalFilter::new(signals);
     write_vcd_header(&mut out, &header)?;
-    let vars = write_vcd_declarations(&mut out, input, &lengths, &filter)?;
+    let vars = write_vcd_declarations(&mut out, &input, &lengths, &filter)?;
     writeln!(out, "$enddefinitions $end")?;
 
     write_vcd_value_changes(
         &mut out,
-        input,
+        &input,
         &lengths,
         &vars,
         &header,
@@ -897,7 +927,7 @@ struct ScopeFrame {
 /// filtering never shifts the id-to-geometry mapping.
 fn write_vcd_declarations<W: Write>(
     out: &mut W,
-    input: &Path,
+    input: &FstInput,
     lengths: &[VariableLength],
     filter: &SignalFilter,
 ) -> std::io::Result<Vec<Option<VcdVar>>> {
@@ -1103,7 +1133,7 @@ fn write_vcd_declarations<W: Write>(
 #[allow(clippy::too_many_arguments)]
 fn write_vcd_value_changes<W: Write>(
     out: &mut W,
-    input: &Path,
+    input: &FstInput,
     lengths: &[VariableLength],
     vars: &[Option<VcdVar>],
     header: &HeaderBlock,
@@ -1135,7 +1165,7 @@ fn write_vcd_value_changes<W: Write>(
     // Set true if any block entirely before the range was skipped.
     let mut blocks_skipped = false;
 
-    let mut iterator = SectionIterator::new(std::fs::File::open(input)?);
+    let mut iterator = SectionIterator::new(input.open()?);
 
     // --- Serial prelude: fold pre-range blocks and locate the first in-range
     // block, so the baseline carried into the range is complete before any
@@ -1978,9 +2008,21 @@ fn write_baseline<W: Write>(
     Ok(())
 }
 
-fn dump(path: &Path) -> std::io::Result<()> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
+fn dump(path: &Path, allow_compressed: bool) -> std::io::Result<()> {
+    let input = FstInput::open_path(path)?;
+    if input.is_wrapped() && !allow_compressed {
+        eprintln!(
+            "warning: input is a gzip-wrapped FST; showing only the wrapper section. \
+             Pass --allow-compressed to decompress and dump the inner FST."
+        );
+        let mut iterator = SectionIterator::new(BufReader::new(std::fs::File::open(path)?));
+        while let Some(section) = iterator.next()? {
+            println!("kind={} len={}", section.block_type, section.len());
+        }
+        return Ok(());
+    }
+
+    let mut reader = input.open()?;
 
     // The geometry block comes after the value change blocks, but is needed to
     // decode them, so the file is read twice.
