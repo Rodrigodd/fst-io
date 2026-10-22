@@ -1,7 +1,7 @@
 use std::io::{BufReader, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use fst_io::*;
 
 #[derive(Parser)]
@@ -9,6 +9,17 @@ use fst_io::*;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// Which clock transition triggers a sample in clock-sampled VCD mode.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum ClockEdge {
+    /// A transition landing on 1.
+    Rising,
+    /// A transition landing on 0.
+    Falling,
+    /// Any transition between the two defined levels.
+    Both,
 }
 
 #[derive(Subcommand)]
@@ -73,6 +84,17 @@ enum Command {
         /// patterns separated by commas. Defaults to every signal.
         #[arg(long = "signal", value_name = "GLOB", value_delimiter = ',')]
         signals: Vec<String>,
+        /// Sample signals only at the edges of this clock, a single 1-bit
+        /// signal selected by a glob (`*`, `?`) that must match exactly one
+        /// signal. Each other signal's value as of just before the edge is
+        /// emitted at the edge's time. The clock itself is not emitted unless
+        /// also selected by --signal.
+        #[arg(long, value_name = "GLOB")]
+        clock: Option<String>,
+        /// Which clock transition triggers a sample. Only meaningful with
+        /// --clock.
+        #[arg(long, requires = "clock", default_value = "rising")]
+        clock_edge: ClockEdge,
     },
     /// Copy a file, keeping only the value change blocks that overlap a time
     /// range.
@@ -128,6 +150,8 @@ fn main() -> std::io::Result<()> {
             end_time,
             jobs,
             signals,
+            clock,
+            clock_edge,
         } => vcd(
             &input,
             output.as_deref(),
@@ -135,6 +159,8 @@ fn main() -> std::io::Result<()> {
             end_time,
             jobs,
             &signals,
+            clock.as_deref(),
+            clock_edge,
         ),
         Command::Splice {
             input,
@@ -814,6 +840,7 @@ fn trim_mantissa_in_exp(s: &mut String) {
 
 /// Converts an FST file to VCD, dumping only value changes whose time is
 /// within `[start_time, end_time]` (defaulting to the whole file).
+#[allow(clippy::too_many_arguments)]
 fn vcd(
     input: &Path,
     output: Option<&Path>,
@@ -821,6 +848,8 @@ fn vcd(
     end_time: Option<u64>,
     jobs: usize,
     signals: &[String],
+    clock: Option<&str>,
+    clock_edge: ClockEdge,
 ) -> std::io::Result<()> {
     if let (Some(start), Some(end)) = (start_time, end_time)
         && start > end
@@ -869,21 +898,29 @@ fn vcd(
     // Second pass over the hierarchy: write the VCD header and declarations,
     // and build the per-variable table indexed by variable id.
     let filter = SignalFilter::new(signals);
+    let clock = clock
+        .map(|pattern| resolve_clock(&input, &lengths, pattern))
+        .transpose()?;
     write_vcd_header(&mut out, &header)?;
     let vars = write_vcd_declarations(&mut out, &input, &lengths, &filter)?;
     writeln!(out, "$enddefinitions $end")?;
 
-    write_vcd_value_changes(
-        &mut out,
-        &input,
-        &lengths,
-        &vars,
-        &header,
-        start,
-        end,
-        jobs,
-        !filter.is_empty(),
-    )?;
+    match clock {
+        Some(clock) => write_vcd_value_changes_clocked(
+            &mut out, &input, &lengths, &vars, &header, start, end, clock, clock_edge,
+        )?,
+        None => write_vcd_value_changes(
+            &mut out,
+            &input,
+            &lengths,
+            &vars,
+            &header,
+            start,
+            end,
+            jobs,
+            !filter.is_empty(),
+        )?,
+    }
 
     out.flush()
 }
@@ -1110,7 +1147,83 @@ fn write_vcd_declarations<W: Write>(
     Ok(vars)
 }
 
-/// Dumps the value changes within `[start, end]`.
+/// A resolved clock signal: its position in geometry order, so its waves and
+/// bits-array slot can be found like any other signal's.
+struct Clock {
+    geometry_index: usize,
+}
+
+/// Resolves the `--clock` glob to a single 1-bit scalar signal. Walks the
+/// hierarchy with the same scope-stack path building the declaration writer
+/// uses, matches each non-alias variable's full dotted path against the
+/// pattern, and requires exactly one 1-bit match.
+fn resolve_clock(
+    input: &FstInput,
+    lengths: &[VariableLength],
+    pattern: &str,
+) -> std::io::Result<Clock> {
+    let glob = pattern.as_bytes();
+    let mut scopes: Vec<String> = Vec::new();
+    let mut geometry_index = 0usize;
+    let mut matches: Vec<(String, usize, VariableLength)> = Vec::new();
+
+    for_each_hierarchy_entry(input, |entry| {
+        match entry {
+            HierarchyEntry::Scope { name, .. } => {
+                scopes.push(String::from_utf8_lossy(&name).into_owned());
+            }
+            HierarchyEntry::UpScope => {
+                scopes.pop();
+            }
+            HierarchyEntry::Var { name, is_alias, .. } => {
+                if is_alias {
+                    return Ok(());
+                }
+                let index = geometry_index;
+                geometry_index += 1;
+                let length = lengths
+                    .get(index)
+                    .copied()
+                    .ok_or_else(|| invalid_data("more variables than geometry lengths"))?;
+                let name = String::from_utf8_lossy(&name).into_owned();
+                let mut path = String::new();
+                for scope in &scopes {
+                    path.push_str(scope);
+                    path.push('.');
+                }
+                path.push_str(&name);
+                if glob_match(glob, path.as_bytes()) {
+                    matches.push((path, index, length));
+                }
+            }
+            HierarchyEntry::AttributeBegin { .. } | HierarchyEntry::AttributeEnd => {}
+        }
+        Ok(())
+    })?;
+
+    match matches.as_slice() {
+        [] => Err(invalid_data("--clock matched no signal")),
+        [(_, index, length)] => {
+            if *length != VariableLength::Bits(1) {
+                return Err(invalid_data("clock signal must be a 1-bit scalar"));
+            }
+            Ok(Clock {
+                geometry_index: *index,
+            })
+        }
+        many => {
+            let paths = many
+                .iter()
+                .map(|(path, ..)| path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("--clock matched several signals: {paths}"),
+            ))
+        }
+    }
+}
 ///
 /// FST value-change blocks are time-ordered and disjoint: every time in block
 /// N precedes every time in block N+1. So the whole dump is already in time
@@ -1499,6 +1612,311 @@ fn write_vcd_value_changes<W: Write>(
     std::mem::forget(pool);
 
     result
+}
+
+/// Dumps signals sampled at the edges of a clock.
+///
+/// Unlike [`write_vcd_value_changes`], this is a single serial time-ordered
+/// pass: deciding what to emit at an edge needs the full current state of every
+/// signal, an accumulation across all prior blocks, so the parallel per-block
+/// decode does not apply.
+///
+/// `baseline`/`baseline_real` carry the running state (last value of every
+/// signal), advanced continuously. At each clock edge the sampled value of a
+/// signal is its value as of strictly before the edge time, so within one time
+/// step the edge is evaluated before that step's changes are folded in. Only
+/// signals that changed since the previous emitted edge are written, and an
+/// edge at which nothing changed produces no `#time`.
+#[allow(clippy::too_many_arguments)]
+fn write_vcd_value_changes_clocked<W: Write>(
+    out: &mut W,
+    input: &FstInput,
+    lengths: &[VariableLength],
+    vars: &[Option<VcdVar>],
+    header: &HeaderBlock,
+    start: u64,
+    end: u64,
+    clock: Clock,
+    clock_edge: ClockEdge,
+) -> std::io::Result<()> {
+    let real_endianness = header.real_endianness;
+
+    // Variable ids in geometry order, so a geometry index maps to its id.
+    let mut ids: Vec<u64> = Vec::new();
+    for_each_hierarchy_entry(input, |entry| {
+        if let HierarchyEntry::Var { id, is_alias, .. } = entry
+            && !is_alias
+        {
+            ids.push(id);
+        }
+        Ok(())
+    })?;
+
+    // Running state: the last value of every signal. `baseline` holds ASCII
+    // scalar/vector values, `baseline_real` holds real bytes, keyed by id.
+    let mut baseline: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+    let mut baseline_real: std::collections::HashMap<u64, [u8; 8]> =
+        std::collections::HashMap::new();
+    // The value of every signal as of the previously emitted edge, to compute
+    // what changed. Seeded from the first emitted frame.
+    let mut emitted: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+    let mut emitted_real: std::collections::HashMap<u64, [u8; 8]> =
+        std::collections::HashMap::new();
+
+    // The clock's last defined level, as an ASCII bit (`b'0'`/`b'1'`), and
+    // whether any edge has emitted yet (first emit opens `$dumpvars`).
+    let mut prev_clock: Option<u8> = None;
+    let mut dumpvars_opened = false;
+    let mut line: Vec<u8> = Vec::new();
+
+    let mut iterator = SectionIterator::new(input.open()?);
+    while let Some(section) = iterator.next()? {
+        if !is_value_change(section.block_type()) {
+            continue;
+        }
+        let section = section.buffer()?;
+        let mut block = section.read_value_changes()?;
+
+        if block.start_time > end {
+            break;
+        }
+
+        let head = block.read_head_layout()?;
+        let tail = block.read_tail_layout()?;
+        let positions = block.read_positions(&head, &tail)?;
+        let times = block.read_time_table(&tail)?;
+        let bits = block.read_bits(&head)?;
+
+        // The bits array is the state at the block's own start; fold it into the
+        // running state before the block's changes advance it.
+        for (index, value) in bits.values(lengths).enumerate() {
+            let value = value?;
+            if let Some(&id) = ids.get(index) {
+                if index == clock.geometry_index {
+                    prev_clock = OwnedValue::from_value(&value).clock_level().or(prev_clock);
+                }
+                update_baseline(&mut baseline, &mut baseline_real, id, &value);
+            }
+        }
+
+        // Collect every change in the block as `(time, geometry_index,
+        // OwnedValue)`. A `Value` borrows the block's wave buffer, so the owned
+        // form is captured to let the events outlive each signal's wave read.
+        // Each signal's waves are already time-sorted; concatenating the runs
+        // and sorting by time groups all changes at one time together.
+        let mut events: Vec<(u64, usize, OwnedValue)> = Vec::new();
+        for (geometry_index, &id) in ids.iter().enumerate() {
+            let waves = block.read_waves(&head, &positions, id, lengths[geometry_index])?;
+            for change in waves.iter() {
+                let (time_index, value) = change?;
+                let time = times
+                    .get(time_index as usize)
+                    .copied()
+                    .ok_or_else(|| invalid_data("time index out of range"))?;
+                events.push((time, geometry_index, OwnedValue::from_value(&value)));
+            }
+        }
+        // Stable sort by time keeps each signal's per-time order within a group.
+        events.sort_by_key(|&(time, _, _)| time);
+
+        // Walk time groups. For each group, evaluate a clock edge against the
+        // state built from strictly-earlier times, then fold the group's
+        // changes into the running state.
+        let mut i = 0usize;
+        while i < events.len() {
+            let time = events[i].0;
+            let mut j = i;
+            // The clock's new level within this group, if the clock changes here.
+            let mut clock_here: Option<u8> = None;
+            while j < events.len() && events[j].0 == time {
+                if events[j].1 == clock.geometry_index {
+                    clock_here = events[j].2.clock_level().or(clock_here);
+                }
+                j += 1;
+            }
+
+            if let Some(new_level) = clock_here
+                && is_edge(prev_clock, new_level, clock_edge)
+                && (start..=end).contains(&time)
+            {
+                emit_clock_sample(
+                    out,
+                    &ids,
+                    vars,
+                    &baseline,
+                    &baseline_real,
+                    &mut emitted,
+                    &mut emitted_real,
+                    real_endianness,
+                    time,
+                    &mut dumpvars_opened,
+                    &mut line,
+                )?;
+            }
+
+            // Fold this group's changes into the running state.
+            for (_, geometry_index, value) in &events[i..j] {
+                if let Some(&id) = ids.get(*geometry_index) {
+                    value.update_baseline(&mut baseline, &mut baseline_real, id);
+                }
+            }
+            if let Some(new_level) = clock_here {
+                prev_clock = Some(new_level);
+            }
+            i = j;
+        }
+    }
+
+    Ok(())
+}
+
+/// An owned snapshot of a [`Value`], captured so an event can outlive the wave
+/// buffer the borrowed `Value` points into. Only what the clocked emitter needs
+/// is kept: the running-state ASCII/real form and the clock level.
+enum OwnedValue {
+    /// A scalar/vector value as its VCD ASCII bytes.
+    Ascii(Vec<u8>),
+    /// A real, as its raw bytes.
+    Real([u8; 8]),
+    /// A variable-length value, which has no running state in a VCD dump.
+    VarLen,
+}
+
+impl OwnedValue {
+    fn from_value(value: &Value) -> Self {
+        match value {
+            Value::Real(bytes) => OwnedValue::Real(*bytes),
+            Value::VarLen(_) => OwnedValue::VarLen,
+            _ => OwnedValue::Ascii(value.to_ascii()),
+        }
+    }
+
+    /// The ASCII bit (`b'0'`/`b'1'`) of a defined single-bit value, or `None`
+    /// for `x`, `z`, a vector, or a real.
+    fn clock_level(&self) -> Option<u8> {
+        match self {
+            OwnedValue::Ascii(bytes) if bytes.len() == 1 => match bytes[0] {
+                b @ (b'0' | b'1') => Some(b),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Advances the running state for `id` the same way [`update_baseline`]
+    /// does for a borrowed [`Value`].
+    fn update_baseline(
+        &self,
+        baseline: &mut std::collections::HashMap<u64, Vec<u8>>,
+        baseline_real: &mut std::collections::HashMap<u64, [u8; 8]>,
+        id: u64,
+    ) {
+        match self {
+            OwnedValue::Real(bytes) => {
+                baseline_real.insert(id, *bytes);
+            }
+            OwnedValue::VarLen => {}
+            OwnedValue::Ascii(bytes) => {
+                baseline.insert(id, bytes.clone());
+            }
+        }
+    }
+}
+
+/// Whether a transition from `prev` to `new_level` is an edge for `clock_edge`.
+/// The first observed level (no `prev`) is never an edge, and a level equal to
+/// `prev` is not a transition.
+fn is_edge(prev: Option<u8>, new_level: u8, clock_edge: ClockEdge) -> bool {
+    let Some(prev) = prev else {
+        return false;
+    };
+    if prev == new_level {
+        return false;
+    }
+    match clock_edge {
+        ClockEdge::Rising => new_level == b'1',
+        ClockEdge::Falling => new_level == b'0',
+        ClockEdge::Both => true,
+    }
+}
+
+/// Emits one clock sample at `time`: a `#time`, then a value line for every
+/// signal whose running state differs from the previously emitted state, then
+/// updates the emitted snapshot. The first sample opens `$dumpvars`.
+#[allow(clippy::too_many_arguments)]
+fn emit_clock_sample<W: Write>(
+    out: &mut W,
+    ids: &[u64],
+    vars: &[Option<VcdVar>],
+    baseline: &std::collections::HashMap<u64, Vec<u8>>,
+    baseline_real: &std::collections::HashMap<u64, [u8; 8]>,
+    emitted: &mut std::collections::HashMap<u64, Vec<u8>>,
+    emitted_real: &mut std::collections::HashMap<u64, [u8; 8]>,
+    real_endianness: RealEndianess,
+    time: u64,
+    dumpvars_opened: &mut bool,
+    line: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    line.clear();
+    for &id in ids {
+        let Some(Some(var)) = vars.get(id as usize) else {
+            continue;
+        };
+        if let Some(bytes) = baseline_real.get(&id) {
+            if emitted_real.get(&id) == Some(bytes) {
+                continue;
+            }
+            emitted_real.insert(id, *bytes);
+            line.extend_from_slice(b"r");
+            line.extend_from_slice(format_real(*bytes, real_endianness).as_bytes());
+            line.push(b' ');
+            line.extend_from_slice(var.code.as_bytes());
+            line.push(b'\n');
+            continue;
+        }
+        let Some(ascii) = baseline.get(&id) else {
+            continue;
+        };
+        if emitted.get(&id).map(Vec::as_slice) == Some(ascii.as_slice()) {
+            continue;
+        }
+        emitted.insert(id, ascii.clone());
+        match var.length {
+            VariableLength::Bits(1) => {
+                line.push(ascii.first().copied().unwrap_or(b'x'));
+                line.extend_from_slice(var.code.as_bytes());
+                line.push(b'\n');
+            }
+            VariableLength::VarLen => {}
+            _ => {
+                line.push(if var.is_port { b'p' } else { b'b' });
+                line.extend_from_slice(ascii);
+                line.push(b' ');
+                line.extend_from_slice(var.code.as_bytes());
+                line.push(b'\n');
+            }
+        }
+    }
+
+    // Nothing changed since the previous emitted edge: skip the empty edge.
+    if line.is_empty() {
+        return Ok(());
+    }
+
+    let mut framing: Vec<u8> = Vec::new();
+    framing.push(b'#');
+    push_u64(&mut framing, time);
+    framing.push(b'\n');
+    if !*dumpvars_opened {
+        framing.extend_from_slice(b"$dumpvars\n");
+        *dumpvars_opened = true;
+        out.write_all(&framing)?;
+        out.write_all(line)?;
+        out.write_all(b"$end\n")?;
+        return Ok(());
+    }
+    out.write_all(&framing)?;
+    out.write_all(line)
 }
 
 /// A block handed to a worker for decoding, tagged with its position in the
@@ -2304,5 +2722,45 @@ mod tests {
             waiter.join().unwrap(),
             "shutdown should unblock take as None"
         );
+    }
+
+    #[test]
+    fn clock_level_is_defined_single_bits_only() {
+        assert_eq!(OwnedValue::Ascii(vec![b'0']).clock_level(), Some(b'0'));
+        assert_eq!(OwnedValue::Ascii(vec![b'1']).clock_level(), Some(b'1'));
+        // x/z are not a defined level.
+        assert_eq!(OwnedValue::Ascii(vec![b'x']).clock_level(), None);
+        assert_eq!(OwnedValue::Ascii(vec![b'z']).clock_level(), None);
+        // A vector or real signal has no single-bit level.
+        assert_eq!(OwnedValue::Ascii(vec![b'1', b'0']).clock_level(), None);
+        assert_eq!(OwnedValue::Real([0; 8]).clock_level(), None);
+        assert_eq!(OwnedValue::VarLen.clock_level(), None);
+    }
+
+    #[test]
+    fn is_edge_rising_fires_only_on_low_to_high() {
+        // The first observed level is never an edge.
+        assert!(!is_edge(None, b'1', ClockEdge::Rising));
+        assert!(is_edge(Some(b'0'), b'1', ClockEdge::Rising));
+        assert!(!is_edge(Some(b'1'), b'0', ClockEdge::Rising));
+        // No transition is not an edge.
+        assert!(!is_edge(Some(b'1'), b'1', ClockEdge::Rising));
+    }
+
+    #[test]
+    fn is_edge_falling_fires_only_on_high_to_low() {
+        assert!(!is_edge(None, b'0', ClockEdge::Falling));
+        assert!(is_edge(Some(b'1'), b'0', ClockEdge::Falling));
+        assert!(!is_edge(Some(b'0'), b'1', ClockEdge::Falling));
+        assert!(!is_edge(Some(b'0'), b'0', ClockEdge::Falling));
+    }
+
+    #[test]
+    fn is_edge_both_fires_on_either_transition() {
+        assert!(!is_edge(None, b'1', ClockEdge::Both));
+        assert!(is_edge(Some(b'0'), b'1', ClockEdge::Both));
+        assert!(is_edge(Some(b'1'), b'0', ClockEdge::Both));
+        // A repeated level is still not a transition.
+        assert!(!is_edge(Some(b'1'), b'1', ClockEdge::Both));
     }
 }
