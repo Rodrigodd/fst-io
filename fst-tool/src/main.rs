@@ -1742,10 +1742,14 @@ fn write_vcd_value_changes_clocked<W: Write>(
     let mut dumpvars_opened = false;
     let mut line: Vec<u8> = Vec::new();
 
-    // Recycled per-block scratch: the change list and the ASCII payload arena
-    // its events index into. Cleared, not reallocated, each block.
+    // Recycled per-block scratch: the change list, the ASCII payload arena its
+    // events index into, the time-sorted output of the counting sort, and the
+    // counting-sort offset table. Cleared, not reallocated, each block.
     let mut events: Vec<Event> = Vec::new();
     let mut payloads: Vec<u8> = Vec::new();
+    let mut sorted: Vec<Event> = Vec::new();
+    let mut offsets: Vec<u32> = Vec::new();
+    let mut cursor: Vec<u32> = Vec::new();
 
     let mut iterator = SectionIterator::new(input.open()?);
     while let Some(section) = iterator.next()? {
@@ -1779,44 +1783,72 @@ fn write_vcd_value_changes_clocked<W: Write>(
 
         // Collect every change in the block as an `Event`. A `Value` borrows
         // the block's wave buffer, so ASCII bytes are copied into the reused
-        // payload arena and the event keeps a `Copy` range into it. Each
-        // signal's waves are already time-sorted; concatenating the runs and
-        // sorting by time groups all changes at one time together.
+        // payload arena and the event keeps a `Copy` range into it. The time
+        // table is strictly increasing, so a counting sort on `time_index`
+        // groups all changes at one time together without an O(n log n) sort.
         events.clear();
         payloads.clear();
+        let table_len = times.len();
+        if table_len > u32::MAX as usize {
+            return Err(invalid_data("time table too large"));
+        }
         for (geometry_index, &id) in ids.iter().enumerate() {
             let waves = block.read_waves(&head, &positions, id, lengths[geometry_index])?;
             for change in waves.iter() {
                 let (time_index, value) = change?;
-                let time = times
-                    .get(time_index as usize)
-                    .copied()
-                    .ok_or_else(|| invalid_data("time index out of range"))?;
+                if time_index as usize >= table_len {
+                    return Err(invalid_data("time index out of range"));
+                }
                 events.push(Event {
-                    time,
+                    time_index: time_index as u32,
                     geometry_index: geometry_index as u32,
                     payload: EventPayload::capture(&value, &mut payloads),
                 });
             }
         }
-        // Stable sort by time keeps each signal's per-time order within a group.
-        events.sort_by_key(|event| event.time);
 
+        // Counting sort by `time_index` into `sorted`. Stable (each bucket fills
+        // in collection order), so a signal's per-time order is preserved.
+        offsets.clear();
+        offsets.resize(table_len + 1, 0);
+        for event in &events {
+            offsets[event.time_index as usize + 1] += 1;
+        }
+        for k in 1..offsets.len() {
+            offsets[k] += offsets[k - 1];
+        }
+        sorted.clear();
+        sorted.resize(
+            events.len(),
+            Event {
+                time_index: 0,
+                geometry_index: 0,
+                payload: EventPayload::VarLen,
+            },
+        );
+        cursor.clear();
+        cursor.extend_from_slice(&offsets);
+        for &event in &events {
+            let slot = &mut cursor[event.time_index as usize];
+            sorted[*slot as usize] = event;
+            *slot += 1;
+        }
         // Walk time groups. For each group, evaluate a clock edge against the
         // state built from strictly-earlier times, then fold the group's
         // changes into the running state.
         let mut i = 0usize;
-        while i < events.len() {
-            let time = events[i].time;
+        while i < sorted.len() {
+            let time_index = sorted[i].time_index;
             let mut j = i;
             // The clock's new level within this group, if the clock changes here.
             let mut clock_here: Option<u8> = None;
-            while j < events.len() && events[j].time == time {
-                if events[j].geometry_index as usize == clock.geometry_index {
-                    clock_here = events[j].payload.clock_level(&payloads).or(clock_here);
+            while j < sorted.len() && sorted[j].time_index == time_index {
+                if sorted[j].geometry_index as usize == clock.geometry_index {
+                    clock_here = sorted[j].payload.clock_level(&payloads).or(clock_here);
                 }
                 j += 1;
             }
+            let time = times[time_index as usize];
 
             if let Some(new_level) = clock_here
                 && is_edge(prev_clock, new_level, clock_edge)
@@ -1838,7 +1870,7 @@ fn write_vcd_value_changes_clocked<W: Write>(
             }
 
             // Fold this group's changes into the running state.
-            for event in &events[i..j] {
+            for event in &sorted[i..j] {
                 event.payload.update_baseline_indexed(
                     &payloads,
                     &mut baseline,
@@ -1873,12 +1905,13 @@ enum EventPayload {
     VarLen,
 }
 
-/// A change in a block: its time, its signal's geometry index, and a `Copy`
-/// value descriptor. Small and `Copy` so the per-block `sort_by_key` moves
-/// trivially and the whole vector is recycled across blocks.
+/// A change in a block: the time-table index of its time, its signal's geometry
+/// index, and a `Copy` value descriptor. Small and `Copy` so the per-block
+/// counting sort scatters it trivially and the whole vector is recycled across
+/// blocks.
 #[derive(Clone, Copy)]
 struct Event {
-    time: u64,
+    time_index: u32,
     geometry_index: u32,
     payload: EventPayload,
 }
