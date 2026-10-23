@@ -656,6 +656,50 @@ const TAG_VAR_MAX: u8 = 29;
 /// FST_VT_VCD_PORT
 const VAR_TYPE_PORT: u8 = 18;
 
+/// Variable types the geometry block records as a real (`VariableLength::Real`):
+/// FST_VT_VCD_REAL, FST_VT_VCD_REAL_PARAMETER, FST_VT_VCD_REALTIME,
+/// FST_VT_SV_SHORTREAL.
+fn is_real_var_type(var_type: u8) -> bool {
+    matches!(var_type, 3 | 4 | 20 | 29)
+}
+
+/// Derives the per-signal geometry lengths from hierarchy entries.
+///
+/// A dump interrupted before its geometry section was written has no geometry
+/// block, but the geometry is redundant: it is reconstructed from the variable
+/// records, one entry per non-aliased variable in id order, exactly as the
+/// geometry block would have stored them. A real is recorded as
+/// [`VariableLength::Real`], a zero-length variable (such as a string) as
+/// [`VariableLength::VarLen`], and everything else by its bit length.
+pub fn geometry_from_entries<I>(entries: I) -> std::io::Result<Vec<VariableLength>>
+where
+    I: IntoIterator<Item = std::io::Result<HierarchyEntry>>,
+{
+    let mut lengths = Vec::new();
+    for entry in entries {
+        if let HierarchyEntry::Var {
+            var_type,
+            length,
+            is_alias,
+            ..
+        } = entry?
+        {
+            if is_alias {
+                continue;
+            }
+            let length = if is_real_var_type(var_type) {
+                VariableLength::Real
+            } else if length == 0 {
+                VariableLength::VarLen
+            } else {
+                VariableLength::Bits(length)
+            };
+            lengths.push(length);
+        }
+    }
+    Ok(lengths)
+}
+
 /// An entry of the hierarchy data.
 ///
 /// Names are kept as raw bytes, since they are not guaranteed to be UTF-8.
@@ -757,6 +801,20 @@ pub struct HierarchyEntries<R> {
 }
 
 impl<R: BufRead> HierarchyEntries<R> {
+    /// Parses a raw, uncompressed hierarchy record stream.
+    ///
+    /// A simulator writes the design hierarchy to a sibling `<file>.fst.hier`
+    /// while the dump is still in progress; that file holds the same records as
+    /// a hierarchy section body, but without the section header, length prefix,
+    /// or compression wrapper that [`HierarchyBlock::entries`] strips.
+    pub fn from_records(reader: R) -> HierarchyEntries<R> {
+        HierarchyEntries {
+            data: reader,
+            next_id: 0,
+            done: false,
+        }
+    }
+
     pub fn read_entry(&mut self) -> std::io::Result<Option<HierarchyEntry>> {
         let tag = match self.data.fill_buf()?.first() {
             Some(&tag) => tag,
@@ -1694,6 +1752,13 @@ impl<R: Read + Seek> SectionIterator<Take<R>> {
             Ok(_) => (),
             Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(err) => return Err(err),
+        }
+
+        // A writer leaves the section it is still building tagged Skip, so a
+        // Skip tag marks the tail of an interrupted dump. Its length field is
+        // not trustworthy; stop the iteration here without reading it.
+        if kind == BlockType::Skip as u8 {
+            return Ok(None);
         }
 
         let mut len: [u8; 8] = [0; 8];

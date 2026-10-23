@@ -257,10 +257,24 @@ fn direction_label(direction: u8) -> String {
 }
 
 /// Calls `f` for each entry of the hierarchy of the file, as they are decoded.
+///
+/// A simulator writing an in-progress dump keeps the design hierarchy in a
+/// sibling `<file>.fst.hier` file until the main file is finalized. When
+/// `hier_sibling` names such a file, its records are read in preference to any
+/// embedded hierarchy section, matching libfst.
 fn for_each_hierarchy_entry(
     input: &FstInput,
+    hier_sibling: Option<&Path>,
     mut f: impl FnMut(HierarchyEntry) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    if let Some(path) = hier_sibling {
+        let reader = BufReader::new(std::fs::File::open(path)?);
+        for entry in HierarchyEntries::from_records(reader) {
+            f(entry?)?;
+        }
+        return Ok(());
+    }
+
     let mut iterator = SectionIterator::new(input.open()?);
     while let Some(section) = iterator.next()? {
         if !matches!(
@@ -278,6 +292,23 @@ fn for_each_hierarchy_entry(
         std::io::ErrorKind::InvalidData,
         "file has no hierarchy block",
     ))
+}
+
+/// Returns `<path>.hier` when a simulator left a sibling hierarchy file beside
+/// an in-progress dump, or `None` when there is none.
+fn hier_sibling_path(path: &Path) -> Option<PathBuf> {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".hier");
+    let sibling = PathBuf::from(name);
+    sibling.is_file().then_some(sibling)
+}
+
+/// Builds the `<path>.hier` sibling path for a splice output, matching the
+/// naming a simulator uses for an in-progress dump.
+fn hier_output_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".hier");
+    PathBuf::from(name)
 }
 
 /// Width of each column of the hierarchy listing. A column that is empty on
@@ -313,12 +344,13 @@ fn push_column(line: &mut String, text: &str, width: usize) {
 /// Prints the requested parts of a file: the header, the hierarchy, or both
 /// (header first). At least one of `header`/`hier` is set by the caller.
 fn info(input: &Path, header: bool, hier: bool, flat: bool, names: bool) -> std::io::Result<()> {
+    let hier_sibling = hier_sibling_path(input);
     let input = FstInput::open_path(input)?;
     if header {
         info_header(&input)?;
     }
     if hier {
-        info_hierarchy(&input, flat, names)?;
+        info_hierarchy(&input, hier_sibling.as_deref(), flat, names)?;
     }
     Ok(())
 }
@@ -359,10 +391,15 @@ fn info_header(input: &FstInput) -> std::io::Result<()> {
 /// The hierarchy is read twice: first to find the width of each column, then
 /// to print it. Entries are decoded as they are printed, never all kept.
 /// With `names`, only the names are printed.
-fn info_hierarchy(input: &FstInput, flat: bool, names: bool) -> std::io::Result<()> {
+fn info_hierarchy(
+    input: &FstInput,
+    hier_sibling: Option<&Path>,
+    flat: bool,
+    names: bool,
+) -> std::io::Result<()> {
     let mut widths = Widths::default();
     if !names {
-        for_each_hierarchy_entry(input, |entry| {
+        for_each_hierarchy_entry(input, hier_sibling, |entry| {
             match entry {
                 HierarchyEntry::Scope { scope_type, .. } if !flat => {
                     widths.type_ = widths.type_.max(scope_type_label(scope_type).len());
@@ -388,7 +425,7 @@ fn info_hierarchy(input: &FstInput, flat: bool, names: bool) -> std::io::Result<
     let mut out = BufWriter::new(std::io::stdout().lock());
     // Names of the open scopes.
     let mut scopes: Vec<String> = Vec::new();
-    for_each_hierarchy_entry(input, |entry| {
+    for_each_hierarchy_entry(input, hier_sibling, |entry| {
         // In the tree the whole line is indented, not only the name.
         let indent = if flat { 0 } else { scopes.len() * 2 };
         let mut line = " ".repeat(indent);
@@ -479,6 +516,7 @@ fn splice(
         ));
     }
 
+    let hier_sibling = hier_sibling_path(input);
     let input = FstInput::open_path(input)?;
     if input.is_wrapped() && !allow_compressed {
         return Err(std::io::Error::new(
@@ -552,6 +590,12 @@ fn splice(
         }
     }
     out.flush()?;
+
+    if let Some(sibling) = hier_sibling {
+        let out_sibling = hier_output_path(output);
+        std::fs::copy(&sibling, &out_sibling)?;
+        println!("Copied sibling hierarchy to {}", out_sibling.display());
+    }
 
     println!("Kept {kept} of {total} value change blocks");
     Ok(())
@@ -860,6 +904,7 @@ fn vcd(
         ));
     }
 
+    let hier_sibling = hier_sibling_path(input);
     let input = FstInput::open_path(input)?;
     let open = || input.open();
 
@@ -884,7 +929,20 @@ fn vcd(
         }
     }
     let header = header.ok_or_else(|| invalid_data("file has no header block"))?;
-    let lengths = lengths.ok_or_else(|| invalid_data("file has no geometry block"))?;
+
+    // An interrupted dump has no geometry section; reconstruct the lengths from
+    // the hierarchy records, which carry the same information.
+    let lengths = match lengths {
+        Some(lengths) => lengths,
+        None => {
+            let mut entries = Vec::new();
+            for_each_hierarchy_entry(&input, hier_sibling.as_deref(), |entry| {
+                entries.push(entry);
+                Ok(())
+            })?;
+            geometry_from_entries(entries.into_iter().map(Ok))?
+        }
+    };
 
     let start = start_time.unwrap_or(header.start_time);
     let end = end_time.unwrap_or(header.end_time);
@@ -899,19 +957,30 @@ fn vcd(
     // and build the per-variable table indexed by variable id.
     let filter = SignalFilter::new(signals);
     let clock = clock
-        .map(|pattern| resolve_clock(&input, &lengths, pattern))
+        .map(|pattern| resolve_clock(&input, hier_sibling.as_deref(), &lengths, pattern))
         .transpose()?;
     write_vcd_header(&mut out, &header)?;
-    let vars = write_vcd_declarations(&mut out, &input, &lengths, &filter)?;
+    let vars =
+        write_vcd_declarations(&mut out, &input, hier_sibling.as_deref(), &lengths, &filter)?;
     writeln!(out, "$enddefinitions $end")?;
 
     match clock {
         Some(clock) => write_vcd_value_changes_clocked(
-            &mut out, &input, &lengths, &vars, &header, start, end, clock, clock_edge,
+            &mut out,
+            &input,
+            hier_sibling.as_deref(),
+            &lengths,
+            &vars,
+            &header,
+            start,
+            end,
+            clock,
+            clock_edge,
         )?,
         None => write_vcd_value_changes(
             &mut out,
             &input,
+            hier_sibling.as_deref(),
             &lengths,
             &vars,
             &header,
@@ -965,6 +1034,7 @@ struct ScopeFrame {
 fn write_vcd_declarations<W: Write>(
     out: &mut W,
     input: &FstInput,
+    hier_sibling: Option<&Path>,
     lengths: &[VariableLength],
     filter: &SignalFilter,
 ) -> std::io::Result<Vec<Option<VcdVar>>> {
@@ -989,7 +1059,7 @@ fn write_vcd_declarations<W: Write>(
     let mut minimal_codes: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
     let mut next_code = 1u64;
 
-    for_each_hierarchy_entry(input, |entry| {
+    for_each_hierarchy_entry(input, hier_sibling, |entry| {
         match entry {
             HierarchyEntry::Scope {
                 scope_type, name, ..
@@ -1159,6 +1229,7 @@ struct Clock {
 /// pattern, and requires exactly one 1-bit match.
 fn resolve_clock(
     input: &FstInput,
+    hier_sibling: Option<&Path>,
     lengths: &[VariableLength],
     pattern: &str,
 ) -> std::io::Result<Clock> {
@@ -1167,7 +1238,7 @@ fn resolve_clock(
     let mut geometry_index = 0usize;
     let mut matches: Vec<(String, usize, VariableLength)> = Vec::new();
 
-    for_each_hierarchy_entry(input, |entry| {
+    for_each_hierarchy_entry(input, hier_sibling, |entry| {
         match entry {
             HierarchyEntry::Scope { name, .. } => {
                 scopes.push(String::from_utf8_lossy(&name).into_owned());
@@ -1247,6 +1318,7 @@ fn resolve_clock(
 fn write_vcd_value_changes<W: Write>(
     out: &mut W,
     input: &FstInput,
+    hier_sibling: Option<&Path>,
     lengths: &[VariableLength],
     vars: &[Option<VcdVar>],
     header: &HeaderBlock,
@@ -1259,7 +1331,7 @@ fn write_vcd_value_changes<W: Write>(
 
     // Variable ids in geometry order, so the bits array can be mapped to ids.
     let mut ids: Vec<u64> = Vec::new();
-    for_each_hierarchy_entry(input, |entry| {
+    for_each_hierarchy_entry(input, hier_sibling, |entry| {
         if let HierarchyEntry::Var { id, is_alias, .. } = entry
             && !is_alias
         {
@@ -1631,6 +1703,7 @@ fn write_vcd_value_changes<W: Write>(
 fn write_vcd_value_changes_clocked<W: Write>(
     out: &mut W,
     input: &FstInput,
+    hier_sibling: Option<&Path>,
     lengths: &[VariableLength],
     vars: &[Option<VcdVar>],
     header: &HeaderBlock,
@@ -1643,7 +1716,7 @@ fn write_vcd_value_changes_clocked<W: Write>(
 
     // Variable ids in geometry order, so a geometry index maps to its id.
     let mut ids: Vec<u64> = Vec::new();
-    for_each_hierarchy_entry(input, |entry| {
+    for_each_hierarchy_entry(input, hier_sibling, |entry| {
         if let HierarchyEntry::Var { id, is_alias, .. } = entry
             && !is_alias
         {
@@ -2427,6 +2500,7 @@ fn write_baseline<W: Write>(
 }
 
 fn dump(path: &Path, allow_compressed: bool) -> std::io::Result<()> {
+    let hier_sibling = hier_sibling_path(path);
     let input = FstInput::open_path(path)?;
     if input.is_wrapped() && !allow_compressed {
         eprintln!(
@@ -2446,6 +2520,7 @@ fn dump(path: &Path, allow_compressed: bool) -> std::io::Result<()> {
     // decode them, so the file is read twice.
     let mut real_endianness = None;
     let mut geometry_lengths = None;
+    let mut hierarchy_seen = false;
 
     let mut iterator = SectionIterator::new(&mut reader);
 
@@ -2470,6 +2545,7 @@ fn dump(path: &Path, allow_compressed: bool) -> std::io::Result<()> {
                 geometry_lengths = Some(lengths);
             }
             Some(BlockType::Hierarchy | BlockType::HierarchyLZ4 | BlockType::HierarchyLZ4Duo) => {
+                hierarchy_seen = true;
                 let hierarchy = section.read_hierarchy()?;
                 println!(
                     "Hierarchy: compression={:?} uncompressed_length={}",
@@ -2488,6 +2564,34 @@ fn dump(path: &Path, allow_compressed: bool) -> std::io::Result<()> {
                 }
             }
             _ => {}
+        }
+    }
+
+    if let Some(sibling) = hier_sibling.as_deref().filter(|_| !hierarchy_seen) {
+        println!("Hierarchy (from sibling {}):", sibling.display());
+        let reader = BufReader::new(std::fs::File::open(sibling)?);
+        let entries =
+            HierarchyEntries::from_records(reader).collect::<std::io::Result<Vec<_>>>()?;
+        let mut depth = 0;
+        for entry in entries.iter().take(20) {
+            if let HierarchyEntry::UpScope = entry {
+                depth -= 1;
+            }
+            println!("  {:indent$}{}", "", entry, indent = depth * 2);
+            if let HierarchyEntry::Scope { .. } = entry {
+                depth += 1;
+            }
+        }
+        if geometry_lengths.is_none() {
+            let lengths = geometry_from_entries(entries.into_iter().map(Ok))?;
+            println!(
+                "Geometry (derived from sibling hierarchy): count={}",
+                lengths.len()
+            );
+            for (i, length) in lengths.iter().take(10).enumerate() {
+                println!("  [{i}] {:?}", length);
+            }
+            geometry_lengths = Some(lengths);
         }
     }
 
@@ -2762,5 +2866,110 @@ mod tests {
         assert!(is_edge(Some(b'1'), b'0', ClockEdge::Both));
         // A repeated level is still not a transition.
         assert!(!is_edge(Some(b'1'), b'1', ClockEdge::Both));
+    }
+
+    /// A scratch directory for fixture files, cleaned up by the caller.
+    fn scratch(tag: &str) -> PathBuf {
+        let mut dir = std::env::var_os("KIROCREW_SCRATCH")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        dir.push(format!("fst-tool-test-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A hierarchy record stream: scope `top`, one 8-bit wire, one real, one
+    /// alias of the wire. Matches the `.hier` sibling format.
+    fn hier_records() -> Vec<u8> {
+        let mut data = vec![254, 0]; // FST_ST_VCD_SCOPE, module
+        data.extend(b"top\0\0");
+        for record in [
+            (16u8, "w", 8u64, 0u64), // FST_VT_VCD_WIRE
+            (3, "r", 8, 0),          // FST_VT_VCD_REAL
+            (16, "alias", 8, 1),     // alias of the wire (alias = id + 1)
+        ] {
+            let (var_type, name, length, alias) = record;
+            data.push(var_type);
+            data.push(1); // FST_VD_INPUT
+            data.extend(name.as_bytes());
+            data.push(0);
+            let mut push_varint = |mut v: u64| loop {
+                let byte = (v & 0x7F) as u8;
+                v >>= 7;
+                if v == 0 {
+                    data.push(byte);
+                    break;
+                }
+                data.push(byte | 0x80);
+            };
+            push_varint(length);
+            push_varint(alias);
+        }
+        data.push(255); // FST_ST_VCD_UPSCOPE
+        data
+    }
+
+    #[test]
+    fn hier_sibling_path_finds_adjacent_hier_file() {
+        let dir = scratch("sibling-detect");
+        let fst = dir.join("dump.fst");
+        std::fs::write(&fst, b"not a real fst").unwrap();
+
+        assert!(hier_sibling_path(&fst).is_none());
+
+        let hier = dir.join("dump.fst.hier");
+        std::fs::write(&hier, hier_records()).unwrap();
+        assert_eq!(hier_sibling_path(&fst), Some(hier));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn for_each_hierarchy_entry_reads_sibling() {
+        // The main file has no hierarchy section; without the sibling the walk
+        // would error, so reaching the records proves the sibling was used.
+        let dir = scratch("sibling-read");
+        let fst = dir.join("dump.fst");
+        std::fs::write(&fst, [BlockType::Skip as u8]).unwrap();
+        let hier = dir.join("dump.fst.hier");
+        std::fs::write(&hier, hier_records()).unwrap();
+
+        let input = FstInput::open_path(&fst).unwrap();
+        let mut names = Vec::new();
+        for_each_hierarchy_entry(&input, Some(hier.as_path()), |entry| {
+            if let HierarchyEntry::Var { name, .. } = entry {
+                names.push(String::from_utf8_lossy(&name).into_owned());
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(names, ["w", "r", "alias"]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn geometry_derived_from_sibling_hierarchy() {
+        let dir = scratch("sibling-geom");
+        let hier = dir.join("dump.fst.hier");
+        std::fs::write(&hier, hier_records()).unwrap();
+
+        let reader = BufReader::new(std::fs::File::open(&hier).unwrap());
+        let entries: Vec<_> = HierarchyEntries::from_records(reader).collect();
+        let lengths = geometry_from_entries(entries).unwrap();
+
+        // The alias contributes no geometry entry; the real becomes `Real`.
+        assert_eq!(lengths, [VariableLength::Bits(8), VariableLength::Real]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hier_output_path_appends_hier_suffix() {
+        assert_eq!(
+            hier_output_path(Path::new("/tmp/out.fst")),
+            PathBuf::from("/tmp/out.fst.hier")
+        );
     }
 }

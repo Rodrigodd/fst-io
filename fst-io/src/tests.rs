@@ -812,3 +812,79 @@ fn temp_file_is_removed_on_drop() {
     assert!(!temp_path.exists());
     std::fs::remove_file(&path).unwrap();
 }
+
+/// Builds a var record with an explicit var type, for geometry derivation.
+fn typed_var(var_type: u8, name: &str, length: u64, alias: u64) -> Vec<u8> {
+    let mut bytes = vec![var_type, 1];
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.push(0);
+    bytes.extend(varint(length));
+    bytes.extend(varint(alias));
+    bytes
+}
+
+#[test]
+fn section_iterator_stops_at_skip_block() {
+    // A real section, then a Skip tag whose length field is zero: the writer
+    // leaves the section it is still building tagged Skip at the tail of an
+    // interrupted dump.
+    let mut file = section(BlockType::Blackout as u8, &[1, 2, 3]);
+    file.push(BlockType::Skip as u8);
+    file.extend_from_slice(&0u64.to_be_bytes());
+    file.extend_from_slice(&[0xDE, 0xAD]); // trailing garbage past the tag
+
+    let mut iterator = SectionIterator::new(std::io::Cursor::new(file));
+
+    let first = iterator.next().unwrap().unwrap();
+    assert_eq!(first.block_type(), Some(BlockType::Blackout));
+    assert_eq!(first.len(), 3);
+
+    assert!(iterator.next().unwrap().is_none());
+}
+
+#[test]
+fn skip_tag_with_zero_length_does_not_error() {
+    // A file that is only a Skip tag with a zero length field is an empty,
+    // interrupted dump; iteration ends rather than erroring on the length.
+    let mut file = vec![BlockType::Skip as u8];
+    file.extend_from_slice(&0u64.to_be_bytes());
+
+    let mut iterator = SectionIterator::new(std::io::Cursor::new(file));
+    assert!(iterator.next().unwrap().is_none());
+}
+
+#[test]
+fn from_records_parses_uncompressed_hierarchy() {
+    // The sibling `.hier` file holds the same records as a hierarchy section
+    // body, uncompressed and without any header or length prefix.
+    let (data, expected) = sample_hierarchy();
+    let entries: Vec<_> = HierarchyEntries::from_records(std::io::Cursor::new(data))
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(entries, expected);
+}
+
+#[test]
+fn geometry_from_entries_matches_geometry_block() {
+    // One of each geometry case: a multi-bit wire, a real, a zero-length
+    // string, a wire alias (no geometry entry), and another wire.
+    let mut data = Vec::new();
+    data.extend(typed_var(16, "wide", 8, 0)); // FST_VT_VCD_WIRE
+    data.extend(typed_var(3, "r", 8, 0)); // FST_VT_VCD_REAL (length is 8 in the record)
+    data.extend(typed_var(21, "s", 0, 0)); // FST_VT_GEN_STRING, zero length
+    data.extend(typed_var(16, "a", 8, 2)); // alias of the wide wire
+    data.extend(typed_var(16, "scalar", 1, 0));
+
+    let entries: Vec<_> = HierarchyEntries::from_records(std::io::Cursor::new(data)).collect();
+    let lengths = geometry_from_entries(entries).unwrap();
+
+    assert_eq!(
+        lengths,
+        [
+            VariableLength::Bits(8),
+            VariableLength::Real,
+            VariableLength::VarLen,
+            VariableLength::Bits(1),
+        ]
+    );
+}
