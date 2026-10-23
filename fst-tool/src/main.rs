@@ -1725,16 +1725,16 @@ fn write_vcd_value_changes_clocked<W: Write>(
         Ok(())
     })?;
 
-    // Running state: the last value of every signal. `baseline` holds ASCII
-    // scalar/vector values, `baseline_real` holds real bytes, keyed by id.
-    let mut baseline: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
-    let mut baseline_real: std::collections::HashMap<u64, [u8; 8]> =
-        std::collections::HashMap::new();
+    // Running state, indexed by geometry index (position in `ids`). `baseline`
+    // holds ASCII scalar/vector values (empty = unset), `baseline_real` holds
+    // real bytes. A dense `Vec` keyed by geometry index avoids a per-signal
+    // hash lookup on every clock edge, which dominates the serial walk.
+    let mut baseline: Vec<Vec<u8>> = vec![Vec::new(); ids.len()];
+    let mut baseline_real: Vec<Option<[u8; 8]>> = vec![None; ids.len()];
     // The value of every signal as of the previously emitted edge, to compute
     // what changed. Seeded from the first emitted frame.
-    let mut emitted: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
-    let mut emitted_real: std::collections::HashMap<u64, [u8; 8]> =
-        std::collections::HashMap::new();
+    let mut emitted: Vec<Vec<u8>> = vec![Vec::new(); ids.len()];
+    let mut emitted_real: Vec<Option<[u8; 8]>> = vec![None; ids.len()];
 
     // The clock's last defined level, as an ASCII bit (`b'0'`/`b'1'`), and
     // whether any edge has emitted yet (first emit opens `$dumpvars`).
@@ -1764,11 +1764,11 @@ fn write_vcd_value_changes_clocked<W: Write>(
         // running state before the block's changes advance it.
         for (index, value) in bits.values(lengths).enumerate() {
             let value = value?;
-            if let Some(&id) = ids.get(index) {
+            if index < ids.len() {
                 if index == clock.geometry_index {
                     prev_clock = OwnedValue::from_value(&value).clock_level().or(prev_clock);
                 }
-                update_baseline(&mut baseline, &mut baseline_real, id, &value);
+                update_baseline_indexed(&mut baseline, &mut baseline_real, index, &value);
             }
         }
 
@@ -1829,9 +1829,7 @@ fn write_vcd_value_changes_clocked<W: Write>(
 
             // Fold this group's changes into the running state.
             for (_, geometry_index, value) in &events[i..j] {
-                if let Some(&id) = ids.get(*geometry_index) {
-                    value.update_baseline(&mut baseline, &mut baseline_real, id);
-                }
+                value.update_baseline_indexed(&mut baseline, &mut baseline_real, *geometry_index);
             }
             if let Some(new_level) = clock_here {
                 prev_clock = Some(new_level);
@@ -1878,19 +1876,21 @@ impl OwnedValue {
 
     /// Advances the running state for `id` the same way [`update_baseline`]
     /// does for a borrowed [`Value`].
-    fn update_baseline(
+    fn update_baseline_indexed(
         &self,
-        baseline: &mut std::collections::HashMap<u64, Vec<u8>>,
-        baseline_real: &mut std::collections::HashMap<u64, [u8; 8]>,
-        id: u64,
+        baseline: &mut [Vec<u8>],
+        baseline_real: &mut [Option<[u8; 8]>],
+        index: usize,
     ) {
         match self {
             OwnedValue::Real(bytes) => {
-                baseline_real.insert(id, *bytes);
+                baseline_real[index] = Some(*bytes);
             }
             OwnedValue::VarLen => {}
             OwnedValue::Ascii(bytes) => {
-                baseline.insert(id, bytes.clone());
+                let slot = &mut baseline[index];
+                slot.clear();
+                slot.extend_from_slice(bytes);
             }
         }
     }
@@ -1921,39 +1921,41 @@ fn emit_clock_sample<W: Write>(
     out: &mut W,
     ids: &[u64],
     vars: &[Option<VcdVar>],
-    baseline: &std::collections::HashMap<u64, Vec<u8>>,
-    baseline_real: &std::collections::HashMap<u64, [u8; 8]>,
-    emitted: &mut std::collections::HashMap<u64, Vec<u8>>,
-    emitted_real: &mut std::collections::HashMap<u64, [u8; 8]>,
+    baseline: &[Vec<u8>],
+    baseline_real: &[Option<[u8; 8]>],
+    emitted: &mut [Vec<u8>],
+    emitted_real: &mut [Option<[u8; 8]>],
     real_endianness: RealEndianess,
     time: u64,
     dumpvars_opened: &mut bool,
     line: &mut Vec<u8>,
 ) -> std::io::Result<()> {
     line.clear();
-    for &id in ids {
+    for (gi, &id) in ids.iter().enumerate() {
         let Some(Some(var)) = vars.get(id as usize) else {
             continue;
         };
-        if let Some(bytes) = baseline_real.get(&id) {
-            if emitted_real.get(&id) == Some(bytes) {
+        if let Some(bytes) = baseline_real[gi] {
+            if emitted_real[gi] == Some(bytes) {
                 continue;
             }
-            emitted_real.insert(id, *bytes);
+            emitted_real[gi] = Some(bytes);
             line.extend_from_slice(b"r");
-            line.extend_from_slice(format_real(*bytes, real_endianness).as_bytes());
+            line.extend_from_slice(format_real(bytes, real_endianness).as_bytes());
             line.push(b' ');
             line.extend_from_slice(var.code.as_bytes());
             line.push(b'\n');
             continue;
         }
-        let Some(ascii) = baseline.get(&id) else {
-            continue;
-        };
-        if emitted.get(&id).map(Vec::as_slice) == Some(ascii.as_slice()) {
+        let ascii = &baseline[gi];
+        if ascii.is_empty() {
             continue;
         }
-        emitted.insert(id, ascii.clone());
+        if emitted[gi].as_slice() == ascii.as_slice() {
+            continue;
+        }
+        emitted[gi].clear();
+        emitted[gi].extend_from_slice(ascii);
         match var.length {
             VariableLength::Bits(1) => {
                 line.push(ascii.first().copied().unwrap_or(b'x'));
@@ -2448,6 +2450,27 @@ fn update_baseline(
         }
         _ => {
             baseline.insert(id, value.to_ascii());
+        }
+    }
+}
+
+/// Records a variable's value into the dense running baseline, keyed by
+/// geometry index. An ASCII value is written into the reused slot in place.
+fn update_baseline_indexed(
+    baseline: &mut [Vec<u8>],
+    baseline_real: &mut [Option<[u8; 8]>],
+    index: usize,
+    value: &Value,
+) {
+    match value {
+        Value::Real(bytes) => {
+            baseline_real[index] = Some(*bytes);
+        }
+        Value::VarLen(_) => {}
+        _ => {
+            let slot = &mut baseline[index];
+            slot.clear();
+            value.write_ascii(slot);
         }
     }
 }

@@ -1495,13 +1495,22 @@ impl Value<'_> {
     /// Returns the value with one ASCII character per bit. For reals and
     /// variable length values, returns the raw bytes.
     pub fn to_ascii(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.write_ascii(&mut out);
+        out
+    }
+
+    /// Appends the value's ASCII form (one character per bit) to `out`. For
+    /// reals and variable length values, appends the raw bytes. Lets a caller
+    /// reuse a buffer instead of allocating a `Vec` per value.
+    pub fn write_ascii(&self, out: &mut Vec<u8>) {
         match *self {
-            Value::Bit(bit) => vec![bit],
-            Value::Packed { data, bits } => (0..bits)
-                .map(|i| b'0' | ((data[i / 8] >> (7 - i % 8)) & 1))
-                .collect(),
-            Value::Ascii(data) | Value::VarLen(data) => data.to_vec(),
-            Value::Real(bytes) => bytes.to_vec(),
+            Value::Bit(bit) => out.push(bit),
+            Value::Packed { data, bits } => {
+                out.extend((0..bits).map(|i| b'0' | ((data[i / 8] >> (7 - i % 8)) & 1)));
+            }
+            Value::Ascii(data) | Value::VarLen(data) => out.extend_from_slice(data),
+            Value::Real(bytes) => out.extend_from_slice(&bytes),
         }
     }
 
