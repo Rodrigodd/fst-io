@@ -1491,6 +1491,22 @@ pub enum Value<'a> {
     VarLen(&'a [u8]),
 }
 
+/// Maps each byte to its 8 bits as ASCII `'0'`/`'1'`, most-significant bit
+/// first, so a packed multi-bit value expands a whole byte at a time.
+static BIT_EXPAND: [[u8; 8]; 256] = {
+    let mut table = [[0u8; 8]; 256];
+    let mut byte = 0usize;
+    while byte < 256 {
+        let mut bit = 0usize;
+        while bit < 8 {
+            table[byte][bit] = b'0' | ((byte >> (7 - bit)) & 1) as u8;
+            bit += 1;
+        }
+        byte += 1;
+    }
+    table
+};
+
 impl Value<'_> {
     /// Returns the value with one ASCII character per bit. For reals and
     /// variable length values, returns the raw bytes.
@@ -1507,7 +1523,14 @@ impl Value<'_> {
         match *self {
             Value::Bit(bit) => out.push(bit),
             Value::Packed { data, bits } => {
-                out.extend((0..bits).map(|i| b'0' | ((data[i / 8] >> (7 - i % 8)) & 1)));
+                let full = bits / 8;
+                for &byte in &data[..full] {
+                    out.extend_from_slice(&BIT_EXPAND[byte as usize]);
+                }
+                let rem = bits % 8;
+                if rem != 0 {
+                    out.extend_from_slice(&BIT_EXPAND[data[full] as usize][..rem]);
+                }
             }
             Value::Ascii(data) | Value::VarLen(data) => out.extend_from_slice(data),
             Value::Real(bytes) => out.extend_from_slice(&bytes),
