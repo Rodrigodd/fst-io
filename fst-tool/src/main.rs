@@ -1735,6 +1735,13 @@ fn write_vcd_value_changes_clocked<W: Write>(
     // what changed. Seeded from the first emitted frame.
     let mut emitted: Vec<Vec<u8>> = vec![Vec::new(); ids.len()];
     let mut emitted_real: Vec<Option<[u8; 8]>> = vec![None; ids.len()];
+    // Geometry indices whose baseline moved since the last emitted edge, so the
+    // emitter visits only changed signals instead of all of them. `dirty_seen`
+    // stamps an index with the current `dirty_epoch` to dedup repeat touches
+    // within one inter-edge interval without clearing a whole array.
+    let mut dirty: Vec<u32> = Vec::new();
+    let mut dirty_seen: Vec<u32> = vec![0u32; ids.len()];
+    let mut dirty_epoch: u32 = 1;
 
     // The clock's last defined level, as an ASCII bit (`b'0'`/`b'1'`), and
     // whether any edge has emitted yet (first emit opens `$dumpvars`).
@@ -1750,6 +1757,7 @@ fn write_vcd_value_changes_clocked<W: Write>(
     let mut sorted: Vec<Event> = Vec::new();
     let mut offsets: Vec<u32> = Vec::new();
     let mut cursor: Vec<u32> = Vec::new();
+    let mut scratch: Vec<u8> = Vec::new();
 
     let mut iterator = SectionIterator::new(input.open()?);
     while let Some(section) = iterator.next()? {
@@ -1777,7 +1785,17 @@ fn write_vcd_value_changes_clocked<W: Write>(
                 if index == clock.geometry_index {
                     prev_clock = value_clock_level(&value).or(prev_clock);
                 }
-                update_baseline_indexed(&mut baseline, &mut baseline_real, index, &value);
+                if update_baseline_indexed(
+                    &mut baseline,
+                    &mut baseline_real,
+                    index,
+                    &value,
+                    &mut scratch,
+                ) && dirty_seen[index] != dirty_epoch
+                {
+                    dirty_seen[index] = dirty_epoch;
+                    dirty.push(index as u32);
+                }
             }
         }
 
@@ -1854,8 +1872,10 @@ fn write_vcd_value_changes_clocked<W: Write>(
                 && is_edge(prev_clock, new_level, clock_edge)
                 && (start..=end).contains(&time)
             {
+                dirty.sort_unstable();
                 emit_clock_sample(
                     out,
+                    &dirty,
                     &ids,
                     vars,
                     &baseline,
@@ -1867,16 +1887,28 @@ fn write_vcd_value_changes_clocked<W: Write>(
                     &mut dumpvars_opened,
                     &mut line,
                 )?;
+                dirty.clear();
+                dirty_epoch = dirty_epoch.wrapping_add(1);
+                if dirty_epoch == 0 {
+                    // Wrapped: reset stamps so a stale 0 cannot alias the new epoch.
+                    dirty_seen.iter_mut().for_each(|s| *s = 0);
+                    dirty_epoch = 1;
+                }
             }
 
             // Fold this group's changes into the running state.
             for event in &sorted[i..j] {
-                event.payload.update_baseline_indexed(
+                let index = event.geometry_index as usize;
+                if event.payload.update_baseline_indexed(
                     &payloads,
                     &mut baseline,
                     &mut baseline_real,
-                    event.geometry_index as usize,
-                );
+                    index,
+                ) && dirty_seen[index] != dirty_epoch
+                {
+                    dirty_seen[index] = dirty_epoch;
+                    dirty.push(index as u32);
+                }
             }
             if let Some(new_level) = clock_here {
                 prev_clock = Some(new_level);
@@ -1946,22 +1978,33 @@ impl EventPayload {
 
     /// Advances the running state for `index` the same way
     /// [`update_baseline_indexed`] does for a borrowed [`Value`].
+    /// Advances the running state for `index` the same way
+    /// [`update_baseline_indexed`] does for a borrowed [`Value`]. Returns
+    /// whether the stored value actually changed, so the caller can mark the
+    /// signal dirty only on a real change.
     fn update_baseline_indexed(
         &self,
         arena: &[u8],
         baseline: &mut [Vec<u8>],
         baseline_real: &mut [Option<[u8; 8]>],
         index: usize,
-    ) {
+    ) -> bool {
         match *self {
             EventPayload::Real(bytes) => {
+                let changed = baseline_real[index] != Some(bytes);
                 baseline_real[index] = Some(bytes);
+                changed
             }
-            EventPayload::VarLen => {}
+            EventPayload::VarLen => false,
             EventPayload::Ascii { start, len } => {
+                let value = &arena[start as usize..(start + len) as usize];
                 let slot = &mut baseline[index];
+                if slot.as_slice() == value {
+                    return false;
+                }
                 slot.clear();
-                slot.extend_from_slice(&arena[start as usize..(start + len) as usize]);
+                slot.extend_from_slice(value);
+                true
             }
         }
     }
@@ -2002,9 +2045,15 @@ fn is_edge(prev: Option<u8>, new_level: u8, clock_edge: ClockEdge) -> bool {
 /// Emits one clock sample at `time`: a `#time`, then a value line for every
 /// signal whose running state differs from the previously emitted state, then
 /// updates the emitted snapshot. The first sample opens `$dumpvars`.
+///
+/// `dirty` is the ascending list of geometry indices whose baseline moved since
+/// the last emitted sample; only those are candidates, so the emitter visits a
+/// handful of signals per edge instead of all of them. Ascending order matches
+/// the reference library's id-order output.
 #[allow(clippy::too_many_arguments)]
 fn emit_clock_sample<W: Write>(
     out: &mut W,
+    dirty: &[u32],
     ids: &[u64],
     vars: &[Option<VcdVar>],
     baseline: &[Vec<u8>],
@@ -2017,7 +2066,9 @@ fn emit_clock_sample<W: Write>(
     line: &mut Vec<u8>,
 ) -> std::io::Result<()> {
     line.clear();
-    for (gi, &id) in ids.iter().enumerate() {
+    for &gi in dirty {
+        let gi = gi as usize;
+        let id = ids[gi];
         let Some(Some(var)) = vars.get(id as usize) else {
             continue;
         };
@@ -2541,22 +2592,33 @@ fn update_baseline(
 }
 
 /// Records a variable's value into the dense running baseline, keyed by
-/// geometry index. An ASCII value is written into the reused slot in place.
+/// geometry index. Returns whether the stored value actually changed. `scratch`
+/// is a reusable buffer the ASCII form is rendered into for the comparison;
+/// when the value differs it is swapped into the slot, reusing both
+/// allocations.
 fn update_baseline_indexed(
     baseline: &mut [Vec<u8>],
     baseline_real: &mut [Option<[u8; 8]>],
     index: usize,
     value: &Value,
-) {
+    scratch: &mut Vec<u8>,
+) -> bool {
     match value {
         Value::Real(bytes) => {
+            let changed = baseline_real[index] != Some(*bytes);
             baseline_real[index] = Some(*bytes);
+            changed
         }
-        Value::VarLen(_) => {}
+        Value::VarLen(_) => false,
         _ => {
+            scratch.clear();
+            value.write_ascii(scratch);
             let slot = &mut baseline[index];
-            slot.clear();
-            value.write_ascii(slot);
+            if slot.as_slice() == scratch.as_slice() {
+                return false;
+            }
+            std::mem::swap(slot, scratch);
+            true
         }
     }
 }
