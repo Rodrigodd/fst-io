@@ -1742,6 +1742,11 @@ fn write_vcd_value_changes_clocked<W: Write>(
     let mut dumpvars_opened = false;
     let mut line: Vec<u8> = Vec::new();
 
+    // Recycled per-block scratch: the change list and the ASCII payload arena
+    // its events index into. Cleared, not reallocated, each block.
+    let mut events: Vec<Event> = Vec::new();
+    let mut payloads: Vec<u8> = Vec::new();
+
     let mut iterator = SectionIterator::new(input.open()?);
     while let Some(section) = iterator.next()? {
         if !is_value_change(section.block_type()) {
@@ -1766,18 +1771,19 @@ fn write_vcd_value_changes_clocked<W: Write>(
             let value = value?;
             if index < ids.len() {
                 if index == clock.geometry_index {
-                    prev_clock = OwnedValue::from_value(&value).clock_level().or(prev_clock);
+                    prev_clock = value_clock_level(&value).or(prev_clock);
                 }
                 update_baseline_indexed(&mut baseline, &mut baseline_real, index, &value);
             }
         }
 
-        // Collect every change in the block as `(time, geometry_index,
-        // OwnedValue)`. A `Value` borrows the block's wave buffer, so the owned
-        // form is captured to let the events outlive each signal's wave read.
-        // Each signal's waves are already time-sorted; concatenating the runs
-        // and sorting by time groups all changes at one time together.
-        let mut events: Vec<(u64, usize, OwnedValue)> = Vec::new();
+        // Collect every change in the block as an `Event`. A `Value` borrows
+        // the block's wave buffer, so ASCII bytes are copied into the reused
+        // payload arena and the event keeps a `Copy` range into it. Each
+        // signal's waves are already time-sorted; concatenating the runs and
+        // sorting by time groups all changes at one time together.
+        events.clear();
+        payloads.clear();
         for (geometry_index, &id) in ids.iter().enumerate() {
             let waves = block.read_waves(&head, &positions, id, lengths[geometry_index])?;
             for change in waves.iter() {
@@ -1786,24 +1792,28 @@ fn write_vcd_value_changes_clocked<W: Write>(
                     .get(time_index as usize)
                     .copied()
                     .ok_or_else(|| invalid_data("time index out of range"))?;
-                events.push((time, geometry_index, OwnedValue::from_value(&value)));
+                events.push(Event {
+                    time,
+                    geometry_index: geometry_index as u32,
+                    payload: EventPayload::capture(&value, &mut payloads),
+                });
             }
         }
         // Stable sort by time keeps each signal's per-time order within a group.
-        events.sort_by_key(|&(time, _, _)| time);
+        events.sort_by_key(|event| event.time);
 
         // Walk time groups. For each group, evaluate a clock edge against the
         // state built from strictly-earlier times, then fold the group's
         // changes into the running state.
         let mut i = 0usize;
         while i < events.len() {
-            let time = events[i].0;
+            let time = events[i].time;
             let mut j = i;
             // The clock's new level within this group, if the clock changes here.
             let mut clock_here: Option<u8> = None;
-            while j < events.len() && events[j].0 == time {
-                if events[j].1 == clock.geometry_index {
-                    clock_here = events[j].2.clock_level().or(clock_here);
+            while j < events.len() && events[j].time == time {
+                if events[j].geometry_index as usize == clock.geometry_index {
+                    clock_here = events[j].payload.clock_level(&payloads).or(clock_here);
                 }
                 j += 1;
             }
@@ -1828,8 +1838,13 @@ fn write_vcd_value_changes_clocked<W: Write>(
             }
 
             // Fold this group's changes into the running state.
-            for (_, geometry_index, value) in &events[i..j] {
-                value.update_baseline_indexed(&mut baseline, &mut baseline_real, *geometry_index);
+            for event in &events[i..j] {
+                event.payload.update_baseline_indexed(
+                    &payloads,
+                    &mut baseline,
+                    &mut baseline_real,
+                    event.geometry_index as usize,
+                );
             }
             if let Some(new_level) = clock_here {
                 prev_clock = Some(new_level);
@@ -1844,29 +1859,51 @@ fn write_vcd_value_changes_clocked<W: Write>(
 /// An owned snapshot of a [`Value`], captured so an event can outlive the wave
 /// buffer the borrowed `Value` points into. Only what the clocked emitter needs
 /// is kept: the running-state ASCII/real form and the clock level.
-enum OwnedValue {
-    /// A scalar/vector value as its VCD ASCII bytes.
-    Ascii(Vec<u8>),
+/// A `Copy` descriptor of a change's value, captured so an event can outlive
+/// the wave buffer the borrowed [`Value`] points into. ASCII bytes live in a
+/// per-block payload arena the event indexes into by range, so collecting a
+/// block's events allocates nothing per change.
+#[derive(Clone, Copy)]
+enum EventPayload {
+    /// A scalar/vector value: `[start, start+len)` into the block's arena.
+    Ascii { start: u32, len: u32 },
     /// A real, as its raw bytes.
     Real([u8; 8]),
     /// A variable-length value, which has no running state in a VCD dump.
     VarLen,
 }
 
-impl OwnedValue {
-    fn from_value(value: &Value) -> Self {
+/// A change in a block: its time, its signal's geometry index, and a `Copy`
+/// value descriptor. Small and `Copy` so the per-block `sort_by_key` moves
+/// trivially and the whole vector is recycled across blocks.
+#[derive(Clone, Copy)]
+struct Event {
+    time: u64,
+    geometry_index: u32,
+    payload: EventPayload,
+}
+
+impl EventPayload {
+    /// Records `value` into `arena`, returning a `Copy` descriptor. ASCII bytes
+    /// are appended to the arena; reals and var-len carry no arena range.
+    fn capture(value: &Value, arena: &mut Vec<u8>) -> Self {
         match value {
-            Value::Real(bytes) => OwnedValue::Real(*bytes),
-            Value::VarLen(_) => OwnedValue::VarLen,
-            _ => OwnedValue::Ascii(value.to_ascii()),
+            Value::Real(bytes) => EventPayload::Real(*bytes),
+            Value::VarLen(_) => EventPayload::VarLen,
+            _ => {
+                let start = arena.len() as u32;
+                value.write_ascii(arena);
+                let len = arena.len() as u32 - start;
+                EventPayload::Ascii { start, len }
+            }
         }
     }
 
     /// The ASCII bit (`b'0'`/`b'1'`) of a defined single-bit value, or `None`
     /// for `x`, `z`, a vector, or a real.
-    fn clock_level(&self) -> Option<u8> {
-        match self {
-            OwnedValue::Ascii(bytes) if bytes.len() == 1 => match bytes[0] {
+    fn clock_level(&self, arena: &[u8]) -> Option<u8> {
+        match *self {
+            EventPayload::Ascii { start, len: 1 } => match arena[start as usize] {
                 b @ (b'0' | b'1') => Some(b),
                 _ => None,
             },
@@ -1874,25 +1911,41 @@ impl OwnedValue {
         }
     }
 
-    /// Advances the running state for `id` the same way [`update_baseline`]
-    /// does for a borrowed [`Value`].
+    /// Advances the running state for `index` the same way
+    /// [`update_baseline_indexed`] does for a borrowed [`Value`].
     fn update_baseline_indexed(
         &self,
+        arena: &[u8],
         baseline: &mut [Vec<u8>],
         baseline_real: &mut [Option<[u8; 8]>],
         index: usize,
     ) {
-        match self {
-            OwnedValue::Real(bytes) => {
-                baseline_real[index] = Some(*bytes);
+        match *self {
+            EventPayload::Real(bytes) => {
+                baseline_real[index] = Some(bytes);
             }
-            OwnedValue::VarLen => {}
-            OwnedValue::Ascii(bytes) => {
+            EventPayload::VarLen => {}
+            EventPayload::Ascii { start, len } => {
                 let slot = &mut baseline[index];
                 slot.clear();
-                slot.extend_from_slice(bytes);
+                slot.extend_from_slice(&arena[start as usize..(start + len) as usize]);
             }
         }
+    }
+}
+
+/// The clock level of a borrowed [`Value`]: the ASCII bit (`b'0'`/`b'1'`) of a
+/// defined single-bit value, or `None` for `x`, `z`, a vector, or a real. Used
+/// to seed the running clock level from a block's initial-state bits array.
+fn value_clock_level(value: &Value) -> Option<u8> {
+    match *value {
+        Value::Bit(b @ (b'0' | b'1')) => Some(b),
+        Value::Ascii([b @ (b'0' | b'1')]) => Some(*b),
+        Value::Packed { bits: 1, data } => match b'0' | (data[0] >> 7) {
+            b @ (b'0' | b'1') => Some(b),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -2853,15 +2906,29 @@ mod tests {
 
     #[test]
     fn clock_level_is_defined_single_bits_only() {
-        assert_eq!(OwnedValue::Ascii(vec![b'0']).clock_level(), Some(b'0'));
-        assert_eq!(OwnedValue::Ascii(vec![b'1']).clock_level(), Some(b'1'));
+        let mut arena = Vec::new();
+        let capture = |arena: &mut Vec<u8>, v: &Value| EventPayload::capture(v, arena);
+        let p0 = capture(&mut arena, &Value::Bit(b'0'));
+        let p1 = capture(&mut arena, &Value::Bit(b'1'));
+        assert_eq!(p0.clock_level(&arena), Some(b'0'));
+        assert_eq!(p1.clock_level(&arena), Some(b'1'));
         // x/z are not a defined level.
-        assert_eq!(OwnedValue::Ascii(vec![b'x']).clock_level(), None);
-        assert_eq!(OwnedValue::Ascii(vec![b'z']).clock_level(), None);
+        let px = capture(&mut arena, &Value::Bit(b'x'));
+        let pz = capture(&mut arena, &Value::Bit(b'z'));
+        assert_eq!(px.clock_level(&arena), None);
+        assert_eq!(pz.clock_level(&arena), None);
         // A vector or real signal has no single-bit level.
-        assert_eq!(OwnedValue::Ascii(vec![b'1', b'0']).clock_level(), None);
-        assert_eq!(OwnedValue::Real([0; 8]).clock_level(), None);
-        assert_eq!(OwnedValue::VarLen.clock_level(), None);
+        let pv = capture(&mut arena, &Value::Ascii(b"10"));
+        assert_eq!(pv.clock_level(&arena), None);
+        assert_eq!(EventPayload::Real([0; 8]).clock_level(&arena), None);
+        assert_eq!(EventPayload::VarLen.clock_level(&arena), None);
+
+        // The borrowed-Value path used to seed the initial clock level agrees.
+        assert_eq!(value_clock_level(&Value::Bit(b'0')), Some(b'0'));
+        assert_eq!(value_clock_level(&Value::Bit(b'1')), Some(b'1'));
+        assert_eq!(value_clock_level(&Value::Bit(b'x')), None);
+        assert_eq!(value_clock_level(&Value::Ascii(b"10")), None);
+        assert_eq!(value_clock_level(&Value::Real([0; 8])), None);
     }
 
     #[test]
