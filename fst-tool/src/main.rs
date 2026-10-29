@@ -529,9 +529,6 @@ fn splice(
     Ok(())
 }
 
-/// FST_VT_VCD_PORT: the length field is a raw value, not a bit count.
-const VAR_TYPE_PORT: u8 = 18;
-
 /// Builds an `InvalidData` I/O error with a static message.
 fn invalid_data(msg: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
@@ -637,14 +634,14 @@ impl SignalFilter {
     }
 }
 
-/// Variable types whose VCD length is fixed at 64 bits (an f64 real).
+/// Variable types whose VCD length is fixed at 64 bits (an f64 real). The
+/// 32-bit shortreal is handled separately, so it is excluded here.
 fn is_real_var(var_type: u8) -> bool {
-    // real, real_parameter, realtime.
-    matches!(var_type, 3 | 4 | 20)
+    matches!(
+        var_type,
+        VAR_TYPE_REAL | VAR_TYPE_REAL_PARAMETER | VAR_TYPE_REALTIME
+    )
 }
-
-/// FST_VT_SV_SHORTREAL: a 32-bit real.
-const VAR_TYPE_SHORTREAL: u8 = 29;
 
 /// Encodes an FST variable id as a VCD identifier code: base 94 starting at
 /// '!', least significant digit first. The id is 1-based (0 is illegal).

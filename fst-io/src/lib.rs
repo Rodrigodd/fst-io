@@ -653,14 +653,24 @@ const TAG_SCOPE: u8 = 254;
 const TAG_UPSCOPE: u8 = 255;
 /// FST_VT_MAX: tags up to this value are variable types (FST_VT_*).
 const TAG_VAR_MAX: u8 = 29;
+/// FST_VT_VCD_REAL: a 64-bit real.
+pub const VAR_TYPE_REAL: u8 = 3;
+/// FST_VT_VCD_REAL_PARAMETER: a 64-bit real.
+pub const VAR_TYPE_REAL_PARAMETER: u8 = 4;
 /// FST_VT_VCD_PORT
-const VAR_TYPE_PORT: u8 = 18;
+pub const VAR_TYPE_PORT: u8 = 18;
+/// FST_VT_VCD_REALTIME: a 64-bit real.
+pub const VAR_TYPE_REALTIME: u8 = 20;
+/// FST_VT_SV_SHORTREAL: a 32-bit real.
+pub const VAR_TYPE_SHORTREAL: u8 = 29;
 
 /// Variable types the geometry block records as a real (`VariableLength::Real`):
-/// FST_VT_VCD_REAL, FST_VT_VCD_REAL_PARAMETER, FST_VT_VCD_REALTIME,
-/// FST_VT_SV_SHORTREAL.
+/// the three 64-bit reals and the 32-bit shortreal.
 fn is_real_var_type(var_type: u8) -> bool {
-    matches!(var_type, 3 | 4 | 20 | 29)
+    matches!(
+        var_type,
+        VAR_TYPE_REAL | VAR_TYPE_REAL_PARAMETER | VAR_TYPE_REALTIME | VAR_TYPE_SHORTREAL
+    )
 }
 
 /// Derives the per-signal geometry lengths from hierarchy entries.
