@@ -649,6 +649,19 @@ fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
     p == pattern.len()
 }
 
+/// The matchable path component of a stored variable name. FST records a
+/// vector's name with its bit range appended (`"a_pad [15:0]"`), which the VCD
+/// `$var` line needs but a `--signal`/`--clock` path pattern must not see --
+/// otherwise an exact pattern (`ir_tb.a_pad`) matches a scalar but never a
+/// vector. The range is the suffix from the first `" ["`; a name without one
+/// is returned unchanged.
+fn name_without_range(name: &str) -> &str {
+    match name.find(" [") {
+        Some(pos) => &name[..pos],
+        None => name,
+    }
+}
+
 /// A set of glob patterns selecting which signals to output. An empty filter
 /// selects everything, so the common no-filter path pays nothing.
 ///
@@ -691,7 +704,7 @@ impl SignalFilter {
                 return true;
             }
         }
-        path.push_str(name);
+        path.push_str(name_without_range(name));
         self.patterns.iter().any(|p| glob_match(p, path.as_bytes()))
     }
 }
@@ -1262,7 +1275,7 @@ fn resolve_clock(
                     path.push_str(scope);
                     path.push('.');
                 }
-                path.push_str(&name);
+                path.push_str(name_without_range(&name));
                 if glob_match(glob, path.as_bytes()) {
                     matches.push((path, index, length));
                 }
@@ -2854,6 +2867,23 @@ mod tests {
         assert!(filter.selects(&["top".into(), "cpu".into()], "clk"));
         assert!(!filter.selects(&["top".into(), "cpu".into()], "rst"));
         assert!(!filter.selects(&["top".into()], "clk"));
+    }
+
+    #[test]
+    fn signal_filter_matches_vector_name_ignoring_range() {
+        // FST stores a vector's name with its bit range appended; an exact
+        // (non-wildcard) pattern must still match it on the base name alone.
+        let filter = SignalFilter::new(&["ir_tb.a_pad".to_string()]);
+        assert!(filter.selects(&["ir_tb".into()], "a_pad [15:0]"));
+        assert!(!filter.selects(&["ir_tb".into()], "a_pad_other [7:0]"));
+    }
+
+    #[test]
+    fn name_without_range_strips_vector_suffix() {
+        assert_eq!(name_without_range("a_pad [15:0]"), "a_pad");
+        assert_eq!(name_without_range("phi_pad"), "phi_pad");
+        // Only the range suffix (` [`) is stripped, not a bracket in the name.
+        assert_eq!(name_without_range("gen[0].q [3:0]"), "gen[0].q");
     }
 
     #[test]
