@@ -1596,7 +1596,7 @@ fn write_vcd_value_changes_clocked<W: Write>(
             let value = value?;
             if index < ids.len() {
                 if index == clock.geometry_index {
-                    prev_clock = value_clock_level(&value).or(prev_clock);
+                    prev_clock = value.clock_level().or(prev_clock);
                 }
                 if update_baseline_indexed(
                     &mut baseline,
@@ -1820,21 +1820,6 @@ impl EventPayload {
                 true
             }
         }
-    }
-}
-
-/// The clock level of a borrowed [`Value`]: the ASCII bit (`b'0'`/`b'1'`) of a
-/// defined single-bit value, or `None` for `x`, `z`, a vector, or a real. Used
-/// to seed the running clock level from a block's initial-state bits array.
-fn value_clock_level(value: &Value) -> Option<u8> {
-    match *value {
-        Value::Bit(b @ (b'0' | b'1')) => Some(b),
-        Value::Ascii([b @ (b'0' | b'1')]) => Some(*b),
-        Value::Packed { bits: 1, data } => match b'0' | (data[0] >> 7) {
-            b @ (b'0' | b'1') => Some(b),
-            _ => None,
-        },
-        _ => None,
     }
 }
 
@@ -2801,11 +2786,11 @@ mod tests {
         assert_eq!(EventPayload::VarLen.clock_level(&arena), None);
 
         // The borrowed-Value path used to seed the initial clock level agrees.
-        assert_eq!(value_clock_level(&Value::Bit(b'0')), Some(b'0'));
-        assert_eq!(value_clock_level(&Value::Bit(b'1')), Some(b'1'));
-        assert_eq!(value_clock_level(&Value::Bit(b'x')), None);
-        assert_eq!(value_clock_level(&Value::Ascii(b"10")), None);
-        assert_eq!(value_clock_level(&Value::Real([0; 8])), None);
+        assert_eq!(Value::Bit(b'0').clock_level(), Some(b'0'));
+        assert_eq!(Value::Bit(b'1').clock_level(), Some(b'1'));
+        assert_eq!(Value::Bit(b'x').clock_level(), None);
+        assert_eq!(Value::Ascii(b"10").clock_level(), None);
+        assert_eq!(Value::Real([0; 8]).clock_level(), None);
     }
 
     #[test]

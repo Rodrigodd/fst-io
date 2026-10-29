@@ -1698,6 +1698,21 @@ impl Value<'_> {
             _ => String::from_utf8_lossy(&self.to_ascii()).into_owned(),
         }
     }
+
+    /// The clock level of a single-bit value: the ASCII bit (`b'0'`/`b'1'`) of
+    /// a defined single-bit value, or `None` for `x`, `z`, a vector, or a
+    /// real.
+    pub fn clock_level(&self) -> Option<u8> {
+        match *self {
+            Value::Bit(b @ (b'0' | b'1')) => Some(b),
+            Value::Ascii([b @ (b'0' | b'1')]) => Some(*b),
+            Value::Packed { bits: 1, data } => match b'0' | (data[0] >> 7) {
+                b @ (b'0' | b'1') => Some(b),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 }
 
 fn real_to_f64(bytes: [u8; 8], endianness: RealEndianess) -> f64 {
