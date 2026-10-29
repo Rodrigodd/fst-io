@@ -926,3 +926,13 @@ fn minimal_alphabet_covers_every_legal_code_once() {
     }
     assert_eq!(seen.len(), 94);
 }
+
+#[test]
+fn format_g_trims_trailing_zeros_and_matches_c() {
+    assert_eq!(format_g(0.0, 16), "0");
+    assert_eq!(format_g(1.25, 16), "1.25");
+    assert_eq!(format_g(-3.5, 16), "-3.5");
+    assert_eq!(format_g(100.0, 16), "100");
+    // A value whose exponent reaches the scientific-notation threshold.
+    assert_eq!(format_g(1e20, 16), "1e20");
+}

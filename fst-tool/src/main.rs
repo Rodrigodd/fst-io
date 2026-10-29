@@ -695,60 +695,6 @@ struct VcdVar {
     is_port: bool,
 }
 
-/// Formats an f64 real the way the reference C library does, with `%.16g`.
-fn format_real(bytes: [u8; 8], endianness: RealEndianess) -> String {
-    let value = match endianness {
-        RealEndianess::LittleEndian => f64::from_le_bytes(bytes),
-        RealEndianess::BigEndian => f64::from_be_bytes(bytes),
-    };
-    // `%.16g` prints up to 16 significant digits, trimming trailing zeros.
-    format_g(value, 16)
-}
-
-/// A minimal `%.*g` formatter: `precision` significant digits, shortest of
-/// fixed and scientific, trailing zeros trimmed.
-fn format_g(value: f64, precision: usize) -> String {
-    if value == 0.0 {
-        return "0".to_string();
-    }
-    if !value.is_finite() {
-        // VCD has no representation for these; emit a readable token.
-        return format!("{value}");
-    }
-    let precision = precision.max(1);
-    let exp = value.abs().log10().floor() as i32;
-    // %g uses scientific notation when the exponent is < -4 or >= precision.
-    if exp < -4 || exp >= precision as i32 {
-        let mut s = format!("{:.*e}", precision - 1, value);
-        trim_mantissa_in_exp(&mut s);
-        s
-    } else {
-        let decimals = (precision as i32 - 1 - exp).max(0) as usize;
-        let s = format!("{value:.decimals$}");
-        trim_trailing_zeros(s)
-    }
-}
-
-/// Trims trailing zeros (and a dangling decimal point) from a fixed-notation
-/// number.
-fn trim_trailing_zeros(s: String) -> String {
-    if !s.contains('.') {
-        return s;
-    }
-    let trimmed = s.trim_end_matches('0');
-    trimmed.trim_end_matches('.').to_string()
-}
-
-/// Trims trailing zeros from the mantissa of a Rust `{:e}` string. Rust never
-/// emits a `+` in the exponent, so only the mantissa needs fixing.
-fn trim_mantissa_in_exp(s: &mut String) {
-    if let Some(e) = s.find('e') {
-        let (mantissa, exp) = s.split_at(e);
-        let mantissa = trim_trailing_zeros(mantissa.to_string());
-        *s = format!("{mantissa}{exp}");
-    }
-}
-
 /// Converts an FST file to VCD, dumping only value changes whose time is
 /// within `[start_time, end_time]` (defaulting to the whole file).
 #[allow(clippy::too_many_arguments)]
@@ -2766,16 +2712,6 @@ mod tests {
         assert_eq!(timescale_label(-7), "100ns");
         assert_eq!(timescale_label(-9), "1ns");
         assert_eq!(timescale_label(-12), "1ps");
-    }
-
-    #[test]
-    fn format_g_trims_trailing_zeros_and_matches_c() {
-        assert_eq!(format_g(0.0, 16), "0");
-        assert_eq!(format_g(1.25, 16), "1.25");
-        assert_eq!(format_g(-3.5, 16), "-3.5");
-        assert_eq!(format_g(100.0, 16), "100");
-        // A value whose exponent reaches the scientific-notation threshold.
-        assert_eq!(format_g(1e20, 16), "1e20");
     }
 
     #[test]

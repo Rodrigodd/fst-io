@@ -1707,6 +1707,56 @@ fn real_to_f64(bytes: [u8; 8], endianness: RealEndianess) -> f64 {
     }
 }
 
+/// Formats an FST real value the way the reference C library does, with
+/// `%.16g`.
+pub fn format_real(bytes: [u8; 8], endianness: RealEndianess) -> String {
+    format_g(real_to_f64(bytes, endianness), 16)
+}
+
+/// A minimal `%.*g` formatter: `precision` significant digits, shortest of
+/// fixed and scientific, trailing zeros trimmed.
+pub fn format_g(value: f64, precision: usize) -> String {
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    if !value.is_finite() {
+        // VCD has no representation for these; emit a readable token.
+        return format!("{value}");
+    }
+    let precision = precision.max(1);
+    let exp = value.abs().log10().floor() as i32;
+    // %g uses scientific notation when the exponent is < -4 or >= precision.
+    if exp < -4 || exp >= precision as i32 {
+        let mut s = format!("{:.*e}", precision - 1, value);
+        trim_mantissa_in_exp(&mut s);
+        s
+    } else {
+        let decimals = (precision as i32 - 1 - exp).max(0) as usize;
+        let s = format!("{value:.decimals$}");
+        trim_trailing_zeros(s)
+    }
+}
+
+/// Trims trailing zeros (and a dangling decimal point) from a fixed-notation
+/// number.
+fn trim_trailing_zeros(s: String) -> String {
+    if !s.contains('.') {
+        return s;
+    }
+    let trimmed = s.trim_end_matches('0');
+    trimmed.trim_end_matches('.').to_string()
+}
+
+/// Trims trailing zeros from the mantissa of a Rust `{:e}` string. Rust never
+/// emits a `+` in the exponent, so only the mantissa needs fixing.
+fn trim_mantissa_in_exp(s: &mut String) {
+    if let Some(e) = s.find('e') {
+        let (mantissa, exp) = s.split_at(e);
+        let mantissa = trim_trailing_zeros(mantissa.to_string());
+        *s = format!("{mantissa}{exp}");
+    }
+}
+
 /// Decompresses FastLZ data whose decompressed size must be `len`.
 fn fastlz_decompress(input: &[u8], len: u64) -> std::io::Result<Vec<u8>> {
     let len = to_usize(len)?;
