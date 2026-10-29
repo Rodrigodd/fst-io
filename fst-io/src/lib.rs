@@ -103,6 +103,34 @@ impl<R: Read> Section<R> {
     }
 }
 
+impl Section<Cursor<Vec<u8>>> {
+    /// The start time recorded in a buffered value-change block's header: the
+    /// first 8 bytes of the section data, before the other fixed-size fields.
+    pub fn value_change_start_time(&self) -> std::io::Result<u64> {
+        let data = self.data.get_ref();
+        let bytes = data
+            .get(0..8)
+            .ok_or_else(|| invalid_data("value change block too short"))?;
+        Ok(u64::from_be_bytes(bytes.try_into().unwrap()))
+    }
+
+    /// The first entry of a buffered value-change block's time table, or `None`
+    /// if the block has no time steps.
+    pub fn value_change_first_time(&self) -> std::io::Result<Option<u64>> {
+        // Reading the time table consumes the section, so work on a clone and
+        // leave this one intact for the caller.
+        let clone = Section {
+            block_type: self.block_type,
+            len: self.len,
+            data: Cursor::new(self.data.get_ref().clone()),
+        };
+        let mut block = clone.read_value_changes()?;
+        let tail = block.read_tail_layout()?;
+        let times = block.read_time_table(&tail)?;
+        Ok(times.first().copied())
+    }
+}
+
 /// A reader positioned within a single section, able to report and change its
 /// offset relative to the start of the section data.
 ///

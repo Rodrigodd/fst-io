@@ -1247,8 +1247,8 @@ fn write_vcd_value_changes<W: Write>(
     // --- Emit the initial frame (if needed) before any value changes. ---
     let frame = match &first_in_range {
         Some(section) => {
-            let block_start = value_change_start_time(section)?;
-            let first_time = value_change_first_time(section)?.unwrap_or(block_start);
+            let block_start = section.value_change_start_time()?;
+            let first_time = section.value_change_first_time()?.unwrap_or(block_start);
             // A separate initial frame is written when the dump does not begin
             // exactly at the first block's first time step: a later start time,
             // a skipped block, or a block whose first time is after its start.
@@ -1259,7 +1259,7 @@ fn write_vcd_value_changes<W: Write>(
     if frame {
         let frame_time = first_in_range
             .as_ref()
-            .map(value_change_start_time)
+            .map(Section::value_change_start_time)
             .transpose()?
             .map(|s| s.max(start))
             .unwrap_or(start);
@@ -1274,7 +1274,7 @@ fn write_vcd_value_changes<W: Write>(
     let initial_time = if frame {
         first_in_range
             .as_ref()
-            .map(value_change_start_time)
+            .map(Section::value_change_start_time)
             .transpose()?
             .map(|s| s.max(start))
     } else {
@@ -1407,7 +1407,7 @@ fn write_vcd_value_changes<W: Write>(
                         };
                         let section = section.buffer_reusing(bundle.bytes)?;
                         // Stop once a block starts past the range.
-                        if value_change_start_time(&section)? > end {
+                        if section.value_change_start_time()? > end {
                             break;
                         }
                         if !dispatch(
@@ -2084,35 +2084,6 @@ fn decode_block_changes(
         offsets,
         framed,
     })
-}
-
-/// Reads a buffered value change block's start time without consuming it.
-fn value_change_start_time(section: &Section<std::io::Cursor<Vec<u8>>>) -> std::io::Result<u64> {
-    let data = section.data.get_ref();
-    // The 24 fixed-size fields follow the already-read section header; the
-    // start time is the first 8 bytes of the section data.
-    let bytes = data
-        .get(0..8)
-        .ok_or_else(|| invalid_data("value change block too short"))?;
-    Ok(u64::from_be_bytes(bytes.try_into().unwrap()))
-}
-
-/// Reads a buffered block's first time-table entry, used to decide framing.
-/// Returns `None` if the block has no time steps.
-fn value_change_first_time(
-    section: &Section<std::io::Cursor<Vec<u8>>>,
-) -> std::io::Result<Option<u64>> {
-    // Decoding the time table needs the tail layout; clone the buffer so the
-    // caller's section is left untouched for dispatch.
-    let clone = Section {
-        block_type: section.block_type,
-        len: section.len,
-        data: std::io::Cursor::new(section.data.get_ref().clone()),
-    };
-    let mut block = clone.read_value_changes()?;
-    let tail = block.read_tail_layout()?;
-    let times = block.read_time_table(&tail)?;
-    Ok(times.first().copied())
 }
 
 /// Rebuilds a buffered section from a value change block whose cursor the
