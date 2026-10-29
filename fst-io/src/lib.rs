@@ -782,6 +782,77 @@ pub fn scope_type_name(scope_type: u8) -> Option<&'static str> {
     NAMES.get(usize::from(scope_type)).copied()
 }
 
+/// Encodes an FST variable id as a VCD identifier code: base 94 starting at
+/// '!', least significant digit first. The id is 1-based (0 is illegal).
+///
+/// This matches `fstVcdID` in the reference C library.
+pub fn vcd_id(mut id: u64) -> String {
+    let mut code = String::new();
+    while id != 0 {
+        id -= 1;
+        code.push((b'!' + (id % 94) as u8) as char);
+        id /= 94;
+    }
+    code
+}
+
+/// The digit alphabet for minimal filtered codes, in the required allocation
+/// order: lowercase, uppercase, digits, then the remaining printable-ASCII VCD
+/// identifier characters (the "special" group, in ASCII order). All 94 legal
+/// identifier characters appear exactly once.
+static MINIMAL_ALPHABET: [u8; 94] = {
+    let mut alphabet = [0u8; 94];
+    let mut i = 0usize;
+    let mut c = b'a';
+    while c <= b'z' {
+        alphabet[i] = c;
+        i += 1;
+        c += 1;
+    }
+    c = b'A';
+    while c <= b'Z' {
+        alphabet[i] = c;
+        i += 1;
+        c += 1;
+    }
+    c = b'0';
+    while c <= b'9' {
+        alphabet[i] = c;
+        i += 1;
+        c += 1;
+    }
+    // The remaining printable ASCII (0x21..=0x7e) that is not alphanumeric.
+    c = b'!';
+    while c <= b'~' {
+        let is_alnum = c.is_ascii_lowercase() || c.is_ascii_uppercase() || c.is_ascii_digit();
+        if !is_alnum {
+            alphabet[i] = c;
+            i += 1;
+        }
+        c += 1;
+    }
+    alphabet
+};
+
+/// Encodes a 1-based ordinal as a minimal VCD identifier code over
+/// [`MINIMAL_ALPHABET`], used when renumbering a filtered set of signals. This
+/// is bijective base-94 written most-significant digit first, so codes grow in
+/// lexical order over the alphabet: `a`, `b`, ... then `aa`, `ab`, ... (not
+/// `aa`, `ba`). The ordinal is 1-based (0 is illegal).
+pub fn minimal_vcd_id(mut n: u64) -> String {
+    const BASE: u64 = 94;
+    let mut digits = Vec::new();
+    while n != 0 {
+        n -= 1;
+        digits.push(MINIMAL_ALPHABET[(n % BASE) as usize]);
+        n /= BASE;
+    }
+    // `digits` holds least-significant first; reverse for MSD-first so the
+    // output orders lexically.
+    digits.reverse();
+    String::from_utf8(digits).expect("alphabet is ASCII")
+}
+
 /// An entry of the hierarchy data.
 ///
 /// Names are kept as raw bytes, since they are not guaranteed to be UTF-8.

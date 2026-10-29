@@ -888,3 +888,41 @@ fn geometry_from_entries_matches_geometry_block() {
         ]
     );
 }
+
+#[test]
+fn vcd_id_is_base_94_from_one() {
+    // Id 1 is the first printable code; 94 wraps into a second digit.
+    assert_eq!(vcd_id(1), "!");
+    assert_eq!(vcd_id(2), "\"");
+    assert_eq!(vcd_id(94), "~");
+    assert_eq!(vcd_id(95), "!!");
+    assert_eq!(vcd_id(96), "\"!");
+}
+
+#[test]
+fn minimal_vcd_id_orders_alphabet_then_lexically() {
+    // Allocation order: lowercase, uppercase, digits, then special.
+    assert_eq!(minimal_vcd_id(1), "a");
+    assert_eq!(minimal_vcd_id(26), "z");
+    assert_eq!(minimal_vcd_id(27), "A");
+    assert_eq!(minimal_vcd_id(52), "Z");
+    assert_eq!(minimal_vcd_id(53), "0");
+    assert_eq!(minimal_vcd_id(62), "9");
+    assert_eq!(minimal_vcd_id(63), "!");
+    assert_eq!(minimal_vcd_id(94), "~");
+    // Bijective base 94, most-significant digit first: the first two-char
+    // code is `aa`, and incrementing changes the last digit (`aa`, `ab`),
+    // not the first (`aa`, `ba`).
+    assert_eq!(minimal_vcd_id(95), "aa");
+    assert_eq!(minimal_vcd_id(96), "ab");
+}
+
+#[test]
+fn minimal_alphabet_covers_every_legal_code_once() {
+    let mut seen = std::collections::HashSet::new();
+    for &c in &MINIMAL_ALPHABET {
+        assert!((b'!'..=b'~').contains(&c), "code {c} outside VCD range");
+        assert!(seen.insert(c), "duplicate code {c}");
+    }
+    assert_eq!(seen.len(), 94);
+}
