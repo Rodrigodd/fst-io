@@ -700,6 +700,78 @@ where
     Ok(lengths)
 }
 
+/// Name of a variable type (FST_VT_*), or `None` if unknown.
+pub fn var_type_name(var_type: u8) -> Option<&'static str> {
+    const NAMES: [&str; 30] = [
+        "event",
+        "integer",
+        "parameter",
+        "real",
+        "real_parameter",
+        "reg",
+        "supply0",
+        "supply1",
+        "time",
+        "tri",
+        "triand",
+        "trior",
+        "trireg",
+        "tri0",
+        "tri1",
+        "wand",
+        "wire",
+        "wor",
+        "port",
+        "sparray",
+        "realtime",
+        "string",
+        "bit",
+        "logic",
+        "int",
+        "shortint",
+        "longint",
+        "byte",
+        "enum",
+        "shortreal",
+    ];
+    NAMES.get(usize::from(var_type)).copied()
+}
+
+/// Name of a variable direction (FST_VD_*), or `None` if unknown.
+pub fn var_direction_name(direction: u8) -> Option<&'static str> {
+    const NAMES: [&str; 6] = ["", "input", "output", "inout", "buffer", "linkage"];
+    NAMES.get(usize::from(direction)).copied()
+}
+
+/// Name of a scope type (FST_ST_*), or `None` if unknown.
+pub fn scope_type_name(scope_type: u8) -> Option<&'static str> {
+    const NAMES: [&str; 22] = [
+        "module",
+        "task",
+        "function",
+        "begin",
+        "fork",
+        "generate",
+        "struct",
+        "union",
+        "class",
+        "interface",
+        "package",
+        "program",
+        "vhdl_architecture",
+        "vhdl_procedure",
+        "vhdl_function",
+        "vhdl_record",
+        "vhdl_process",
+        "vhdl_block",
+        "vhdl_for_generate",
+        "vhdl_if_generate",
+        "vhdl_generate",
+        "vhdl_package",
+    ];
+    NAMES.get(usize::from(scope_type)).copied()
+}
+
 /// An entry of the hierarchy data.
 ///
 /// Names are kept as raw bytes, since they are not guaranteed to be UTF-8.
