@@ -2982,6 +2982,10 @@ pub struct BlockEncoder {
     cursor: Vec<u32>,
     /// The block's changes, grouped by signal and in time order within each.
     order: Vec<BufferedChange>,
+    /// The changes of one group of signals while [`sort`](Self::sort)
+    /// orders them, and where each group's next change goes.
+    group: Vec<BufferedChange>,
+    group_cursor: Vec<usize>,
     value: Vec<u8>,
     previous: Vec<u8>,
     /// The uncompressed waves stored so far, to find dynamic aliases.
@@ -3016,6 +3020,8 @@ impl BlockEncoder {
             starts: Vec::new(),
             cursor: Vec::new(),
             order: Vec::new(),
+            group: Vec::new(),
+            group_cursor: Vec::new(),
             value: Vec::new(),
             previous: Vec::new(),
             waves: Vec::new(),
@@ -3093,17 +3099,46 @@ impl BlockEncoder {
         for (i, slot) in block.slots.iter().enumerate() {
             self.starts[i + 1] = self.starts[i] + slot.changes;
         }
-        self.cursor.clear();
-        self.cursor.extend_from_slice(&self.starts[..count]);
-        // Every entry up to the block's change count is overwritten below, so
-        // the vector only grows and keeps whatever a larger block left past it.
         if self.order.len() < block.changes.len() {
             self.order.resize(block.changes.len(), PLACEHOLDER_CHANGE);
         }
+        self.cursor.clear();
+        self.cursor.extend_from_slice(&self.starts[..count]);
+
+        // Scattering straight to every signal's range writes to as many
+        // places at once as there are signals. Scattering first to at most
+        // 256 groups of signals, then within each group, keeps both passes'
+        // writes in a few places at a time, and a group's changes fit in
+        // the cache while they are sorted.
+        let key_bits = usize::BITS - count.saturating_sub(1).leading_zeros();
+        let fine_bits = key_bits.saturating_sub(8).max(8);
+        if key_bits <= fine_bits {
+            for change in &block.changes {
+                let slot = &mut self.cursor[change.handle()];
+                self.order[*slot as usize] = *change;
+                *slot += 1;
+            }
+            return;
+        }
+        let groups = count.div_ceil(1 << fine_bits);
+        let starts = &self.starts;
+        let group_start = |group: usize| starts[(group << fine_bits).min(count)] as usize;
+        self.group_cursor.clear();
+        self.group_cursor.extend((0..groups).map(group_start));
         for change in &block.changes {
-            let slot = &mut self.cursor[change.handle()];
-            self.order[*slot as usize] = *change;
+            let slot = &mut self.group_cursor[change.handle() >> fine_bits];
+            self.order[*slot] = *change;
             *slot += 1;
+        }
+        for group in 0..groups {
+            let range = group_start(group)..group_start(group + 1);
+            self.group.clear();
+            self.group.extend_from_slice(&self.order[range]);
+            for change in &self.group {
+                let slot = &mut self.cursor[change.handle()];
+                self.order[*slot as usize] = *change;
+                *slot += 1;
+            }
         }
     }
 
