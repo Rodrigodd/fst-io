@@ -1580,7 +1580,7 @@ impl Record for BlockBuffer {
     }
 }
 
-impl<W: std::io::Write + std::io::Seek> Record for FstValueWriter<W> {
+impl<W: std::io::Write + std::io::Seek + Send + 'static> Record for FstValueWriter<W> {
     fn record(&mut self, handle: FstSignalHandle, input: &Input) -> std::io::Result<()> {
         record_input!(self, handle, input)
     }
@@ -2234,4 +2234,101 @@ fn format_enums_match_the_type_names() {
     }
     assert_eq!(AttributeType::Pack as u8, 3);
     assert_eq!(FileType::VerilogVhdl as u8, 2);
+}
+
+#[test]
+fn thread_count_does_not_change_the_file() {
+    for seed in 0..20 {
+        let options = |threads, max_blocks_in_flight| FstWriterOptions {
+            block_size: 200,
+            threads,
+            max_blocks_in_flight,
+            ..FstWriterOptions::default()
+        };
+        let inline = write_random_file(seed, options(0, 1));
+        for (threads, in_flight) in [(1, 1), (2, 1), (4, 2), (4, 8)] {
+            let threaded = write_random_file(seed, options(threads, in_flight));
+            assert!(
+                inline.bytes == threaded.bytes,
+                "seed {seed} threads {threads} in flight {in_flight}"
+            );
+        }
+        check_random_file(&inline, false, seed);
+    }
+}
+
+/// An output that fails, or panics, once more than `limit` bytes are
+/// written.
+struct BrokenWriter {
+    written: usize,
+    limit: usize,
+    panics: bool,
+}
+
+impl std::io::Write for BrokenWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.written + buf.len() > self.limit {
+            assert!(!self.panics, "broken writer");
+            return Err(std::io::Error::other("broken writer"));
+        }
+        self.written += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::io::Seek for BrokenWriter {
+    fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+        Ok(self.written as u64)
+    }
+}
+
+/// Writes many blocks to a [`BrokenWriter`] and returns the first error.
+fn first_error(threads: usize, panics: bool) -> std::io::Error {
+    let out = BrokenWriter {
+        written: 0,
+        limit: 2000,
+        panics,
+    };
+    let options = FstWriterOptions {
+        block_size: 100,
+        threads,
+        max_blocks_in_flight: 2,
+        ..FstWriterOptions::default()
+    };
+    let mut writer = FstHierarchyWriter::new(out, options).unwrap();
+    let a = writer
+        .var(VarType::Wire, VarDirection::Implicit, b"a", 64)
+        .unwrap();
+    let mut values = writer.into_values().unwrap();
+    let mut run = || -> std::io::Result<()> {
+        for time in 0..10_000 {
+            values.time(time)?;
+            values.change_u64(a, time.wrapping_mul(0x9E37_79B9_7F4A_7C15))?;
+            if time % 100 == 0 {
+                values.flush()?;
+            }
+        }
+        Ok(())
+    };
+    match run() {
+        Err(error) => error,
+        Ok(()) => values.finish().map(drop).unwrap_err(),
+    }
+}
+
+#[test]
+fn output_errors_are_returned() {
+    for threads in [0, 1, 3] {
+        assert_eq!(first_error(threads, false).to_string(), "broken writer");
+    }
+}
+
+#[test]
+fn a_panicking_writer_thread_is_returned_as_an_error() {
+    let error = first_error(2, true);
+    assert_eq!(error.to_string(), "an FST writer thread panicked");
 }

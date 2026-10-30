@@ -2354,6 +2354,12 @@ impl BlockBuffer {
         })
     }
 
+    /// A block without signals, for [`start_next`](Self::start_next) to
+    /// reset.
+    fn placeholder() -> BlockBuffer {
+        BlockBuffer::new(&[]).expect("an empty geometry is valid")
+    }
+
     /// The geometry the block was made for.
     pub fn geometry(&self) -> &[VariableLength] {
         &self.layout.geometry
@@ -3473,6 +3479,14 @@ pub struct FstWriterOptions {
     /// A block is sealed at the first time change once this many bytes are
     /// buffered (see [`BlockBuffer::len_bytes`]).
     pub block_size: usize,
+    /// Encoder threads. With 0, blocks are encoded and written on the
+    /// caller's thread; otherwise one more thread writes them in order. The
+    /// file is the same for any count.
+    pub threads: usize,
+    /// Sealed blocks that may wait to be encoded or written before sealing
+    /// another blocks the caller. At least `threads` keeps every encoder
+    /// busy.
+    pub max_blocks_in_flight: usize,
     pub encode: EncodeOptions,
 }
 
@@ -3485,6 +3499,8 @@ impl Default for FstWriterOptions {
             writer: b"fst-io".to_vec(),
             date: Vec::new(),
             block_size: 64 << 20,
+            threads: 0,
+            max_blocks_in_flight: 4,
             encode: EncodeOptions::default(),
         }
     }
@@ -3496,7 +3512,7 @@ impl Default for FstWriterOptions {
 /// Dropping the writer finishes the file as one with no value changes,
 /// ignoring errors; call [`into_values`](Self::into_values) and
 /// [`FstValueWriter::finish`] to see them.
-pub struct FstHierarchyWriter<W: Write + Seek> {
+pub struct FstHierarchyWriter<W: Write + Seek + Send + 'static> {
     out: Option<W>,
     options: FstWriterOptions,
     hierarchy: Vec<u8>,
@@ -3506,7 +3522,7 @@ pub struct FstHierarchyWriter<W: Write + Seek> {
     open_scopes: usize,
 }
 
-impl<W: Write + Seek> FstHierarchyWriter<W> {
+impl<W: Write + Seek + Send + 'static> FstHierarchyWriter<W> {
     /// Starts a file written to `out`. Nothing is written until
     /// [`into_values`](Self::into_values).
     pub fn new(out: W, options: FstWriterOptions) -> std::io::Result<FstHierarchyWriter<W>> {
@@ -3517,6 +3533,9 @@ impl<W: Write + Seek> FstHierarchyWriter<W> {
         }
         if options.date.len() >= 26 {
             return Err(invalid_input("date string must be shorter than 26 bytes"));
+        }
+        if options.threads > 0 && options.max_blocks_in_flight == 0 {
+            return Err(invalid_input("max_blocks_in_flight must be at least 1"));
         }
         Ok(FstHierarchyWriter {
             out: Some(out),
@@ -3706,7 +3725,7 @@ impl<W: Write + Seek> FstHierarchyWriter<W> {
     }
 }
 
-impl<W: Write + Seek> Drop for FstHierarchyWriter<W> {
+impl<W: Write + Seek + Send + 'static> Drop for FstHierarchyWriter<W> {
     fn drop(&mut self) {
         if self.out.is_some()
             && let Ok(values) = self.start_values()
@@ -3807,32 +3826,41 @@ fn encode_blackout_section(blackouts: &[(u64, bool)], out: &mut Vec<u8>) {
 ///
 /// Dropping the writer finishes the file, ignoring errors; call
 /// [`finish`](Self::finish) to see them.
-pub struct FstValueWriter<W: Write + Seek> {
-    out: Option<W>,
+pub struct FstValueWriter<W: Write + Seek + Send + 'static> {
+    output: Option<Output<W>>,
     header: HeaderBlock,
     block: BlockBuffer,
-    spare: Option<BlockBuffer>,
-    encoder: BlockEncoder,
-    section: Vec<u8>,
     block_size: usize,
     flush_pending: bool,
     blackouts: Vec<(u64, bool)>,
 }
 
-impl<W: Write + Seek> FstValueWriter<W> {
+impl<W: Write + Seek + Send + 'static> FstValueWriter<W> {
     fn new(
         out: W,
         header: HeaderBlock,
         geometry: &[VariableLength],
         options: &FstWriterOptions,
     ) -> std::io::Result<FstValueWriter<W>> {
+        let output = if options.threads == 0 {
+            Output::Inline {
+                out,
+                encoder: Box::new(BlockEncoder::new(options.encode)),
+                section: Vec::new(),
+                spare: None,
+            }
+        } else {
+            Output::Threads(Pipeline::new(
+                out,
+                options.threads,
+                options.max_blocks_in_flight,
+                options.encode,
+            )?)
+        };
         Ok(FstValueWriter {
-            out: Some(out),
+            output: Some(output),
             header,
             block: BlockBuffer::new(geometry)?,
-            spare: None,
-            encoder: BlockEncoder::new(options.encode),
-            section: Vec::new(),
             block_size: options.block_size,
             flush_pending: false,
             blackouts: Vec::new(),
@@ -3927,70 +3955,364 @@ impl<W: Write + Seek> FstValueWriter<W> {
         self.blackouts.push((time, active));
     }
 
-    /// Seals the current block at the next time change.
+    /// Seals the current block at the next time change. Returns an error an
+    /// encoder or writer thread met since the last call.
     pub fn flush(&mut self) -> std::io::Result<()> {
         self.flush_pending = true;
-        Ok(())
+        match &self.output {
+            Some(Output::Threads(pipeline)) => pipeline.shared.check(),
+            _ => Ok(()),
+        }
     }
 
-    /// Writes the last block and the blackout section, rewrites the header,
-    /// and returns the output.
+    /// Writes the last block and the blackout section, waits for every block
+    /// to be written, rewrites the header, and returns the output.
     pub fn finish(mut self) -> std::io::Result<W> {
-        let result = self.finish_file();
-        let out = self.out.take().expect("taken only by finish");
-        result.map(|()| out)
+        self.finish_file()
     }
 
     fn seal(&mut self) -> std::io::Result<()> {
-        let mut next = match self.spare.take() {
-            Some(next) => next,
-            None => BlockBuffer::new(&[])?,
-        };
-        self.block.start_next(&mut next)?;
-        let sealed = std::mem::replace(&mut self.block, next);
         self.flush_pending = false;
-        let result = self.write_block(&sealed);
-        self.spare = Some(sealed);
-        result
-    }
-
-    fn write_block(&mut self, block: &BlockBuffer) -> std::io::Result<()> {
-        self.encoder.encode(block, &mut self.section)?;
-        let out = self.out.as_mut().expect("present until finished");
-        out.write_all(&self.section)?;
+        let output = self.output.as_mut().expect("present until finished");
+        output.seal(&mut self.block)?;
         self.header.num_vc_blocks += 1;
         Ok(())
     }
 
-    fn finish_file(&mut self) -> std::io::Result<()> {
+    fn finish_file(&mut self) -> std::io::Result<W> {
         if self.block.end_time().is_none() {
             self.time(0)?;
         }
-        if self.block.has_time_step() {
-            let block = std::mem::replace(&mut self.block, BlockBuffer::new(&[])?);
-            let result = self.write_block(&block);
-            self.block = block;
-            result?;
-        }
+        let output = self.output.take().expect("present until finished");
         self.header.end_time = self.block.end_time().expect("a time was pushed");
+        let last = if self.block.has_time_step() {
+            self.header.num_vc_blocks += 1;
+            Some(std::mem::replace(
+                &mut self.block,
+                BlockBuffer::placeholder(),
+            ))
+        } else {
+            None
+        };
+        let mut out = output.finish(last)?;
 
-        let out = self.out.as_mut().expect("present until finished");
         if !self.blackouts.is_empty() {
-            encode_blackout_section(&self.blackouts, &mut self.section);
-            out.write_all(&self.section)?;
+            let mut section = Vec::new();
+            encode_blackout_section(&self.blackouts, &mut section);
+            out.write_all(&section)?;
         }
         let end = out.stream_position()?;
         out.seek(SeekFrom::Start(9))?;
         out.write_all(&self.header.to_bytes())?;
         out.seek(SeekFrom::Start(end))?;
-        out.flush()
+        out.flush()?;
+        Ok(out)
     }
 }
 
-impl<W: Write + Seek> Drop for FstValueWriter<W> {
+impl<W: Write + Seek + Send + 'static> Drop for FstValueWriter<W> {
     fn drop(&mut self) {
-        if self.out.is_some() {
+        if self.output.is_some() {
             let _ = self.finish_file();
         }
     }
+}
+
+/// Where sealed blocks go: encoded and written on the caller's thread, or
+/// handed to a [`Pipeline`].
+enum Output<W> {
+    Inline {
+        out: W,
+        encoder: Box<BlockEncoder>,
+        section: Vec<u8>,
+        spare: Option<BlockBuffer>,
+    },
+    Threads(Pipeline<W>),
+}
+
+impl<W: Write + Send + 'static> Output<W> {
+    /// Replaces `block` by the block that follows it, and encodes and writes
+    /// `block`.
+    fn seal(&mut self, block: &mut BlockBuffer) -> std::io::Result<()> {
+        match self {
+            Output::Inline {
+                out,
+                encoder,
+                section,
+                spare,
+            } => {
+                let mut next = spare.take().unwrap_or_else(BlockBuffer::placeholder);
+                block.start_next(&mut next)?;
+                let sealed = std::mem::replace(block, next);
+                let result = encoder
+                    .encode(&sealed, section)
+                    .and_then(|()| out.write_all(section));
+                *spare = Some(sealed);
+                result
+            }
+            Output::Threads(pipeline) => {
+                let mut next = pipeline.reserve()?;
+                if let Err(err) = block.start_next(&mut next) {
+                    pipeline.release(next);
+                    return Err(err);
+                }
+                let sealed = std::mem::replace(block, next);
+                pipeline.send(sealed)
+            }
+        }
+    }
+
+    /// Encodes and writes `last`, waits for every block to be written, and
+    /// returns the output.
+    fn finish(self, last: Option<BlockBuffer>) -> std::io::Result<W> {
+        match self {
+            Output::Inline {
+                mut out,
+                mut encoder,
+                mut section,
+                ..
+            } => {
+                if let Some(last) = last {
+                    encoder.encode(&last, &mut section)?;
+                    out.write_all(&section)?;
+                }
+                Ok(out)
+            }
+            Output::Threads(pipeline) => pipeline.finish(last),
+        }
+    }
+}
+
+/// A pool of encoder threads and a writer thread. Sealed blocks are numbered
+/// in order; the encoders take them in any order, and the writer puts the
+/// sections back in order before writing them.
+struct Pipeline<W> {
+    jobs: Option<std::sync::mpsc::Sender<(u64, BlockBuffer)>>,
+    shared: Arc<PipelineShared>,
+    encoders: Vec<std::thread::JoinHandle<()>>,
+    writer: std::thread::JoinHandle<Option<W>>,
+    next_sequence: u64,
+}
+
+struct PipelineShared {
+    state: std::sync::Mutex<PipelineState>,
+    /// Signalled when a block is written or an error is stored.
+    changed: std::sync::Condvar,
+    max_in_flight: usize,
+}
+
+struct PipelineState {
+    /// Blocks sealed and not yet written.
+    in_flight: usize,
+    /// The first error of an encoder or writer thread.
+    error: Option<std::io::Error>,
+    free_blocks: Vec<BlockBuffer>,
+    free_sections: Vec<Vec<u8>>,
+}
+
+impl PipelineShared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PipelineState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn fail(&self, error: std::io::Error) {
+        let mut state = self.lock();
+        state.error.get_or_insert(error);
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    fn check(&self) -> std::io::Result<()> {
+        match &self.lock().error {
+            Some(error) => Err(copy_error(error)),
+            None => Ok(()),
+        }
+    }
+}
+
+fn copy_error(error: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(error.kind(), error.to_string())
+}
+
+/// Stores an error when a pipeline thread panics, so the caller does not
+/// wait for a block that will never be written.
+struct PanicGuard<'a>(&'a PipelineShared);
+
+impl Drop for PanicGuard<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0
+                .fail(std::io::Error::other("an FST writer thread panicked"));
+        }
+    }
+}
+
+impl<W: Write + Send + 'static> Pipeline<W> {
+    fn new(
+        out: W,
+        threads: usize,
+        max_in_flight: usize,
+        options: EncodeOptions,
+    ) -> std::io::Result<Pipeline<W>> {
+        let shared = Arc::new(PipelineShared {
+            state: std::sync::Mutex::new(PipelineState {
+                in_flight: 0,
+                error: None,
+                free_blocks: Vec::new(),
+                free_sections: Vec::new(),
+            }),
+            changed: std::sync::Condvar::new(),
+            max_in_flight,
+        });
+        let (jobs, job_receiver) = std::sync::mpsc::channel();
+        let job_receiver = Arc::new(std::sync::Mutex::new(job_receiver));
+        let (sections, section_receiver) = std::sync::mpsc::channel();
+
+        let mut encoders = Vec::with_capacity(threads);
+        for i in 0..threads {
+            let job_receiver = Arc::clone(&job_receiver);
+            let sections = sections.clone();
+            let shared = Arc::clone(&shared);
+            let encoder = std::thread::Builder::new()
+                .name(format!("fst-encode-{i}"))
+                .spawn(move || encode_blocks(&job_receiver, &sections, &shared, options))?;
+            encoders.push(encoder);
+        }
+        drop(sections);
+        let writer_shared = Arc::clone(&shared);
+        let writer = std::thread::Builder::new()
+            .name("fst-write".to_string())
+            .spawn(move || write_sections(out, section_receiver, &writer_shared))?;
+
+        Ok(Pipeline {
+            jobs: Some(jobs),
+            shared,
+            encoders,
+            writer,
+            next_sequence: 0,
+        })
+    }
+
+    /// Waits for room for one more sealed block, and returns a block buffer
+    /// to fill next.
+    fn reserve(&mut self) -> std::io::Result<BlockBuffer> {
+        let mut state = self.shared.lock();
+        while state.in_flight >= self.shared.max_in_flight && state.error.is_none() {
+            state = self
+                .shared
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        if let Some(error) = &state.error {
+            return Err(copy_error(error));
+        }
+        state.in_flight += 1;
+        Ok(state
+            .free_blocks
+            .pop()
+            .unwrap_or_else(BlockBuffer::placeholder))
+    }
+
+    /// Gives back a block from [`reserve`](Self::reserve) that was not sent.
+    fn release(&mut self, block: BlockBuffer) {
+        let mut state = self.shared.lock();
+        state.in_flight -= 1;
+        state.free_blocks.push(block);
+    }
+
+    fn send(&mut self, block: BlockBuffer) -> std::io::Result<()> {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        let jobs = self.jobs.as_ref().expect("present until finished");
+        if jobs.send((sequence, block)).is_err() {
+            self.shared.check()?;
+            return Err(std::io::Error::other("FST encoder threads stopped"));
+        }
+        Ok(())
+    }
+
+    fn finish(mut self, last: Option<BlockBuffer>) -> std::io::Result<W> {
+        let sent = match last {
+            Some(last) => self.reserve().and_then(|spare| {
+                self.shared.lock().free_blocks.push(spare);
+                self.send(last)
+            }),
+            None => Ok(()),
+        };
+        drop(self.jobs.take());
+        for encoder in self.encoders.drain(..) {
+            let _ = encoder.join();
+        }
+        let out = self.writer.join();
+        self.shared.check()?;
+        sent?;
+        match out {
+            Ok(Some(out)) => Ok(out),
+            _ => Err(std::io::Error::other("FST writer thread stopped")),
+        }
+    }
+}
+
+fn encode_blocks(
+    jobs: &std::sync::Mutex<std::sync::mpsc::Receiver<(u64, BlockBuffer)>>,
+    sections: &std::sync::mpsc::Sender<(u64, Vec<u8>)>,
+    shared: &PipelineShared,
+    options: EncodeOptions,
+) {
+    let _guard = PanicGuard(shared);
+    let mut encoder = BlockEncoder::new(options);
+    loop {
+        let job = jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv();
+        let Ok((sequence, block)) = job else {
+            return;
+        };
+        let mut section = shared.lock().free_sections.pop().unwrap_or_default();
+        let result = encoder.encode(&block, &mut section);
+        shared.lock().free_blocks.push(block);
+        match result {
+            Ok(()) => {
+                if sections.send((sequence, section)).is_err() {
+                    return;
+                }
+            }
+            Err(error) => {
+                shared.fail(error);
+                return;
+            }
+        }
+    }
+}
+
+/// Writes the encoded sections in sequence order, and returns `out`, or
+/// `None` after an error.
+fn write_sections<W: Write>(
+    mut out: W,
+    sections: std::sync::mpsc::Receiver<(u64, Vec<u8>)>,
+    shared: &PipelineShared,
+) -> Option<W> {
+    let _guard = PanicGuard(shared);
+    let mut pending = std::collections::BTreeMap::new();
+    let mut next = 0u64;
+    for (sequence, section) in sections {
+        pending.insert(sequence, section);
+        while let Some(section) = pending.remove(&next) {
+            if let Err(error) = out.write_all(&section) {
+                shared.fail(error);
+                return None;
+            }
+            next += 1;
+            let mut state = shared.lock();
+            state.in_flight -= 1;
+            state.free_sections.push(section);
+            drop(state);
+            shared.changed.notify_all();
+        }
+    }
+    Some(out)
 }
