@@ -2675,7 +2675,7 @@ impl BlockBuffer {
     /// Records the low `n` bits of `value`, for an n-bit signal with
     /// `n <= 64`.
     pub fn change_u64(&mut self, handle: FstSignalHandle, value: u64) -> std::io::Result<()> {
-        self.change_le(handle, 64, &value.to_le_bytes(), None)
+        self.change_le(handle, &[value], None)
     }
 
     /// Records an n-bit value given as `ceil(n / 32)` words, least
@@ -2686,8 +2686,7 @@ impl BlockBuffer {
         handle: FstSignalHandle,
         words: &[u32],
     ) -> std::io::Result<()> {
-        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
-        self.change_le(handle, 32, &bytes, None)
+        self.change_le(handle, words, None)
     }
 
     /// Like [`change_words32`](Self::change_words32), with 64-bit words.
@@ -2696,8 +2695,7 @@ impl BlockBuffer {
         handle: FstSignalHandle,
         words: &[u64],
     ) -> std::io::Result<()> {
-        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
-        self.change_le(handle, 64, &bytes, None)
+        self.change_le(handle, words, None)
     }
 
     /// Records a four-state value as VPI-style planes of 32-bit words, least
@@ -2709,44 +2707,45 @@ impl BlockBuffer {
         aval: &[u32],
         bval: &[u32],
     ) -> std::io::Result<()> {
-        let aval: Vec<u8> = aval.iter().flat_map(|word| word.to_le_bytes()).collect();
-        let bval: Vec<u8> = bval.iter().flat_map(|word| word.to_le_bytes()).collect();
-        self.change_le(handle, 32, &aval, Some(&bval))
+        self.change_le(handle, aval, Some(bval))
     }
 
-    /// Records a value given as little-endian `word_bits`-bit words, with the
-    /// x/z plane of a four-state value.
-    fn change_le(
+    /// Records a value given as little-endian words, with the x/z plane of a
+    /// four-state value.
+    fn change_le<T: LeWord>(
         &mut self,
         handle: FstSignalHandle,
-        word_bits: usize,
-        aval: &[u8],
-        bval: Option<&[u8]>,
+        aval: &[T],
+        bval: Option<&[T]>,
     ) -> std::io::Result<()> {
         let time_index = self.current_index();
         let VariableLength::Bits(n) = self.check_current(handle)? else {
             return Err(invalid_input("value does not match the signal's length"));
         };
         let n = n as usize;
-        if aval.len() != n.div_ceil(word_bits) * word_bits / 8
+        if aval.len() != n.div_ceil(T::BYTES * 8)
             || bval.is_some_and(|bval| bval.len() != aval.len())
         {
             return Err(invalid_input("value does not match the signal's length"));
         }
         if n == 1 {
-            let ascii = four_state_ascii(aval[0] & 1, bval.map_or(0, |bval| bval[0] & 1));
+            let bval = bval.map_or(0, |bval| bval[0].to_le()[0] & 1);
+            let ascii = four_state_ascii(aval[0].to_le()[0] & 1, bval);
             return self.push_bit(handle, time_index, ascii);
         }
+        let offset =
+            u32::try_from(self.payload.len()).map_err(|_| invalid_input("block buffer is full"))?;
         let len = n.div_ceil(8);
-        match bval {
-            None => self.push_payload(handle, time_index, ChangeForm::Le, &[&aval[..len]]),
-            Some(bval) => self.push_payload(
-                handle,
-                time_index,
-                ChangeForm::FourState,
-                &[&aval[..len], &bval[..len]],
-            ),
-        }
+        extend_le(&mut self.payload, aval, len);
+        let form = match bval {
+            None => ChangeForm::Le,
+            Some(bval) => {
+                extend_le(&mut self.payload, bval, len);
+                ChangeForm::FourState
+            }
+        };
+        self.push(handle, time_index, form, offset);
+        Ok(())
     }
 
     /// Records a real.
@@ -2763,6 +2762,38 @@ impl BlockBuffer {
     /// Records a value of a variable-length signal, such as a string.
     pub fn change_var_len(&mut self, handle: FstSignalHandle, bytes: &[u8]) -> std::io::Result<()> {
         self.change(handle, Value::VarLen(bytes))
+    }
+}
+
+/// A word of a value given least significant word first.
+trait LeWord: Copy {
+    const BYTES: usize;
+    /// The word's little-endian bytes, zero-padded to 8.
+    fn to_le(self) -> [u8; 8];
+}
+
+impl LeWord for u32 {
+    const BYTES: usize = 4;
+    fn to_le(self) -> [u8; 8] {
+        u64::from(self).to_le_bytes()
+    }
+}
+
+impl LeWord for u64 {
+    const BYTES: usize = 8;
+    fn to_le(self) -> [u8; 8] {
+        self.to_le_bytes()
+    }
+}
+
+/// Appends the first `len` bytes of the little-endian value made of `words`.
+fn extend_le<T: LeWord>(out: &mut Vec<u8>, words: &[T], len: usize) {
+    for (i, word) in words.iter().enumerate() {
+        let start = i * T::BYTES;
+        if start >= len {
+            break;
+        }
+        out.extend_from_slice(&word.to_le()[..(len - start).min(T::BYTES)]);
     }
 }
 
