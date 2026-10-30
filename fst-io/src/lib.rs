@@ -2875,6 +2875,10 @@ pub struct BlockEncoder {
     positions: Vec<WavePosition>,
     pack: Vec<u8>,
     lz4: Vec<u8>,
+    /// LZ4 hash tables for inputs shorter than 64 KiB and for longer ones,
+    /// the split `lz4_flex::block::compress_into` makes.
+    lz4_small: lz4_flex::block::CompressTable,
+    lz4_large: lz4_flex::block::CompressTable,
     zlib: Vec<u8>,
     table: Vec<u8>,
 }
@@ -2904,6 +2908,8 @@ impl BlockEncoder {
             positions: Vec::new(),
             pack: Vec::new(),
             lz4: Vec::new(),
+            lz4_small: lz4_flex::block::CompressTable::small(),
+            lz4_large: lz4_flex::block::CompressTable::large(),
             zlib: Vec::new(),
             table: Vec::new(),
         }
@@ -3045,8 +3051,14 @@ impl BlockEncoder {
                 self.lz4.clear();
                 self.lz4
                     .resize(lz4_flex::block::get_maximum_output_size(wave.len()), 0);
-                let compressed = lz4_flex::block::compress_into(wave, &mut self.lz4)
-                    .expect("output is sized for the worst case");
+                let table = if wave.len() < u16::MAX as usize {
+                    &mut self.lz4_small
+                } else {
+                    &mut self.lz4_large
+                };
+                let compressed =
+                    lz4_flex::block::compress_into_with_table(wave, &mut self.lz4, table)
+                        .expect("output is sized for the worst case");
                 if compressed < wave.len() {
                     write_varint(&mut self.pack, wave.len() as u64);
                     self.pack.extend_from_slice(&self.lz4[..compressed]);
