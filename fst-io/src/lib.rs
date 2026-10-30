@@ -3168,16 +3168,62 @@ impl BlockEncoder {
         memory_required
     }
 
+    /// [`write_wave`](Self::write_wave) for a 1-bit signal, whose changes all
+    /// hold their ASCII byte inline.
+    fn write_bit_wave(
+        &mut self,
+        block: &BlockBuffer,
+        signal: usize,
+        changes: std::ops::Range<usize>,
+    ) {
+        let mut previous = self
+            .options
+            .deduplicate
+            .then(|| block.frame[block.layout.frame_offsets[signal]]);
+        let mut previous_index = 0u64;
+        let order = &self.order[changes];
+        for (i, &change) in order.iter().enumerate() {
+            if let Some(next) = order.get(i + 1)
+                && next.time_index == change.time_index
+            {
+                continue;
+            }
+            let ascii = change.data as u8;
+            let at_first_step = block.first && change.time_index == 0;
+            if let Some(previous) = &mut previous {
+                if !at_first_step && ascii == *previous {
+                    continue;
+                }
+                *previous = ascii;
+            }
+            let time_index = u64::from(change.time_index);
+            let delta = time_index - previous_index;
+            previous_index = time_index;
+            if ascii == b'0' || ascii == b'1' {
+                write_varint(&mut self.waves, delta << 2 | u64::from(ascii & 1) << 1);
+            } else {
+                let code = ONE_BIT_VALUES
+                    .iter()
+                    .position(|&v| v == ascii)
+                    .expect("checked when recorded") as u64;
+                write_varint(&mut self.waves, delta << 4 | code << 1 | 1);
+            }
+        }
+    }
+
     /// Appends the wave of `signal` to `waves`, from the changes at
     /// `order[changes]`.
     fn write_wave(&mut self, block: &BlockBuffer, signal: usize, changes: std::ops::Range<usize>) {
         let length = block.layout.geometry[signal];
+        if length == VariableLength::Bits(1) {
+            self.write_bit_wave(block, signal, changes);
+            return;
+        }
         let dedup = self.options.deduplicate && length != VariableLength::VarLen;
         if dedup {
             let offset = block.layout.frame_offsets[signal];
             self.previous.clear();
             match length {
-                VariableLength::Bits(1) => self.previous.push(block.frame[offset]),
                 VariableLength::Bits(bits) => {
                     let ascii = &block.frame[offset..offset + bits as usize];
                     pack_ascii(ascii, &mut self.previous);
@@ -3207,19 +3253,6 @@ impl BlockEncoder {
             previous_index = time_index;
             let waves = &mut self.waves;
             match length {
-                VariableLength::Bits(1) => {
-                    let ascii = self.value[0];
-                    if ascii == b'0' || ascii == b'1' {
-                        write_varint(waves, delta << 2 | u64::from(ascii & 1) << 1);
-                    } else {
-                        let code = ONE_BIT_VALUES
-                            .iter()
-                            .position(|&v| v == ascii)
-                            .expect("checked when recorded")
-                            as u64;
-                        write_varint(waves, delta << 4 | code << 1 | 1);
-                    }
-                }
                 VariableLength::Bits(_) => {
                     write_varint(waves, delta << 1 | u64::from(!packed));
                     waves.extend_from_slice(&self.value);
