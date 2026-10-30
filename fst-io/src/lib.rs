@@ -3077,8 +3077,11 @@ impl BlockEncoder {
         }
         self.cursor.clear();
         self.cursor.extend_from_slice(&self.starts[..count]);
-        self.order.clear();
-        self.order.resize(block.changes.len(), PLACEHOLDER_CHANGE);
+        // Every entry up to the block's change count is overwritten below, so
+        // the vector only grows and keeps whatever a larger block left past it.
+        if self.order.len() < block.changes.len() {
+            self.order.resize(block.changes.len(), PLACEHOLDER_CHANGE);
+        }
         for change in &block.changes {
             let slot = &mut self.cursor[change.handle()];
             self.order[*slot as usize] = *change;
