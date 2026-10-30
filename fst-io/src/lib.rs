@@ -2470,7 +2470,12 @@ impl BlockBuffer {
             return Err(invalid_input("time index out of range"));
         }
         let last = self.last_change[handle.index()];
-        if last != NO_CHANGE && self.changes[last as usize].time_index as usize > time_index {
+        // A change at the current time index is never out of order, so only
+        // `change_at` reads the previous change back from the log.
+        if time_index != self.current_index()
+            && last != NO_CHANGE
+            && self.changes[last as usize].time_index as usize > time_index
+        {
             return Err(invalid_input("changes of a signal must be in time order"));
         }
         if u32::try_from(self.changes.len() + 1).is_err() {
