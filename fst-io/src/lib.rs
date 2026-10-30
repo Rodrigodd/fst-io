@@ -2296,6 +2296,8 @@ enum ChangeForm {
     Real,
     /// A little-endian `u32` length, then the bytes.
     VarLen,
+    /// A two-state value of at most 32 bits; `data` is the value itself.
+    Word,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2333,7 +2335,8 @@ impl BufferedChange {
             3 => ChangeForm::Le,
             4 => ChangeForm::FourState,
             5 => ChangeForm::Real,
-            _ => ChangeForm::VarLen,
+            6 => ChangeForm::VarLen,
+            _ => ChangeForm::Word,
         }
     }
 }
@@ -2768,6 +2771,12 @@ impl BlockBuffer {
             let ascii = four_state_ascii(aval[0].to_le()[0] & 1, bval);
             return self.push_bit(handle, time_index, ascii);
         }
+        if n <= 32 && bval.is_none() {
+            let low = aval[0].to_le();
+            let word = u32::from_le_bytes([low[0], low[1], low[2], low[3]]);
+            self.push(handle, time_index, ChangeForm::Word, word);
+            return Ok(());
+        }
         let offset =
             u32::try_from(self.payload.len()).map_err(|_| invalid_input("block buffer is full"))?;
         let len = n.div_ceil(8);
@@ -2885,6 +2894,10 @@ fn wave_value(
         ChangeForm::Ascii => pack_ascii(&payload[start..start + bits], out),
         ChangeForm::Le => {
             pack_le(&payload[start..start + len], bits, out);
+            true
+        }
+        ChangeForm::Word => {
+            pack_le(&change.data.to_le_bytes()[..len], bits, out);
             true
         }
         ChangeForm::FourState => {
