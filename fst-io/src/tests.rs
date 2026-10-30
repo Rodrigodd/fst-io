@@ -936,3 +936,127 @@ fn format_g_trims_trailing_zeros_and_matches_c() {
     // A value whose exponent reaches the scientific-notation threshold.
     assert_eq!(format_g(1e20, 16), "1e20");
 }
+
+/// A 321-byte header section with the given time range; other fields are zero
+/// except the real-endianness marker, which `read_header` validates.
+fn header_section(start_time: u64, end_time: u64) -> Vec<u8> {
+    let mut bytes = [0u8; HeaderBlock::LEN];
+    bytes[0..8].copy_from_slice(&start_time.to_be_bytes());
+    bytes[8..16].copy_from_slice(&end_time.to_be_bytes());
+    bytes[16..24].copy_from_slice(&std::f64::consts::E.to_le_bytes());
+    section(BlockType::Header as u8, &bytes)
+}
+
+/// A whole FST file an [`FstReader`] can open: a header, a geometry block for
+/// the four variables `value_change_block` describes (lengths 1, 4, 4, 1), and
+/// that value-change block.
+fn reader_fixture() -> Vec<u8> {
+    let mut file = header_section(10, 22);
+    file.extend(geometry(&[1, 4, 4, 1], 4));
+    file.extend(value_change_block());
+    file
+}
+
+#[test]
+fn read_value_changes_streams_all_changes_with_absolute_time() {
+    let path = write_temp(&reader_fixture(), "reader-vc");
+    let reader = FstReader::open(FstInput::open_path(&path).unwrap()).unwrap();
+    assert_eq!(reader.header().start_time, 10);
+    assert_eq!(
+        reader.geometry(),
+        [
+            VariableLength::Bits(1),
+            VariableLength::Bits(4),
+            VariableLength::Bits(4),
+            VariableLength::Bits(1),
+        ]
+    );
+
+    let mut seen: Vec<(u64, usize, Vec<u8>)> = Vec::new();
+    reader
+        .read_value_changes(
+            TimeFilter {
+                start: 0,
+                end: u64::MAX,
+            },
+            None,
+            |time, handle, value| {
+                seen.push((time, handle.index(), value.to_ascii()));
+                Ok::<(), std::convert::Infallible>(())
+            },
+        )
+        .unwrap();
+
+    // Per-signal then per-change: geometry index 0, 1, then 2 (alias of 1); 3
+    // has no changes. Time indices 0/1/2 resolve to 10/15/22.
+    assert_eq!(
+        seen,
+        [
+            (10, 0, b"1".to_vec()),
+            (15, 0, b"z".to_vec()),
+            (10, 1, b"1010".to_vec()),
+            (22, 1, b"x01z".to_vec()),
+            (10, 2, b"1010".to_vec()),
+            (22, 2, b"x01z".to_vec()),
+        ]
+    );
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn read_value_changes_filters_by_handle() {
+    let path = write_temp(&reader_fixture(), "reader-vc-filter");
+    let reader = FstReader::open(FstInput::open_path(&path).unwrap()).unwrap();
+
+    let include = [FstSignalHandle::from_index(0)];
+    let mut handles: Vec<usize> = Vec::new();
+    reader
+        .read_value_changes(
+            TimeFilter {
+                start: 0,
+                end: u64::MAX,
+            },
+            Some(&include),
+            |_time, handle, _value| {
+                handles.push(handle.index());
+                Ok::<(), std::convert::Infallible>(())
+            },
+        )
+        .unwrap();
+    assert_eq!(handles, [0, 0]);
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn read_value_changes_honours_the_time_window() {
+    let path = write_temp(&reader_fixture(), "reader-vc-window");
+    let reader = FstReader::open(FstInput::open_path(&path).unwrap()).unwrap();
+
+    // Window [15, 22] drops the time-index-0 (t=10) changes, keeps 15 and 22.
+    let mut times: Vec<u64> = Vec::new();
+    reader
+        .read_value_changes(TimeFilter { start: 15, end: 22 }, None, |time, _h, _v| {
+            times.push(time);
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap();
+    assert_eq!(times, [15, 22, 22]);
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn read_value_changes_propagates_callback_error() {
+    let path = write_temp(&reader_fixture(), "reader-vc-err");
+    let reader = FstReader::open(FstInput::open_path(&path).unwrap()).unwrap();
+
+    let result = reader.read_value_changes(
+        TimeFilter {
+            start: 0,
+            end: u64::MAX,
+        },
+        None,
+        |_time, _handle, _value| Err("stop"),
+    );
+    assert!(matches!(result, Err(ReadError::Callback("stop"))));
+    std::fs::remove_file(&path).unwrap();
+}

@@ -767,6 +767,14 @@ impl std::fmt::Display for FstSignalHandle {
     }
 }
 
+/// An inclusive time window, `[start, end]`, for
+/// [`FstReader::read_value_changes`].
+#[derive(Debug, Clone, Copy)]
+pub struct TimeFilter {
+    pub start: u64,
+    pub end: u64,
+}
+
 /// A high-level reader that ties a whole FST file together: its header,
 /// geometry, hierarchy, and value changes.
 ///
@@ -900,7 +908,114 @@ impl FstReader {
         }
         Err(invalid_data("file has no hierarchy block"))
     }
+
+    /// Streams the value changes of the file as `(time, handle, value)`,
+    /// restricted to the inclusive time window and, when `include` is given, to
+    /// the listed signals.
+    ///
+    /// This is the convenience streaming path, modelled on the reference
+    /// readers' iterate-blocks callback. It decodes blocks serially on the
+    /// calling thread; a consumer that needs the parallel/arena optimizations
+    /// drives the block readers directly instead.
+    ///
+    /// The first argument of `callback` is the absolute time (resolved from the
+    /// block's time table). A callback error aborts the stream and is returned
+    /// verbatim.
+    pub fn read_value_changes<E>(
+        &self,
+        time: TimeFilter,
+        include: Option<&[FstSignalHandle]>,
+        mut callback: impl FnMut(u64, FstSignalHandle, Value) -> Result<(), E>,
+    ) -> Result<(), ReadError<E>> {
+        let mut mask = vec![include.is_none(); self.geometry.len()];
+        if let Some(include) = include {
+            for handle in include {
+                if let Some(slot) = mask.get_mut(handle.index()) {
+                    *slot = true;
+                }
+            }
+        }
+
+        let mut iterator = SectionIterator::new(self.input.open().map_err(ReadError::Io)?);
+        while let Some(section) = iterator.next().map_err(ReadError::Io)? {
+            if !matches!(
+                section.block_type(),
+                Some(
+                    BlockType::ValueChangeData
+                        | BlockType::ValueChangeDataDynamicAlias
+                        | BlockType::ValueChangeDataDynamicAlias2
+                )
+            ) {
+                continue;
+            }
+            let section = section.buffer().map_err(ReadError::Io)?;
+            self.read_block_value_changes(section, &time, &mask, &mut callback)?;
+        }
+        Ok(())
+    }
+
+    fn read_block_value_changes<E>(
+        &self,
+        section: Section<Cursor<Vec<u8>>>,
+        time: &TimeFilter,
+        mask: &[bool],
+        callback: &mut impl FnMut(u64, FstSignalHandle, Value) -> Result<(), E>,
+    ) -> Result<(), ReadError<E>> {
+        let mut block = section.read_value_changes().map_err(ReadError::Io)?;
+        let head = block.read_head_layout().map_err(ReadError::Io)?;
+        let tail = block.read_tail_layout().map_err(ReadError::Io)?;
+        let positions = block.read_positions(&head, &tail).map_err(ReadError::Io)?;
+        let times = block.read_time_table(&tail).map_err(ReadError::Io)?;
+
+        // The time table is strictly increasing, so the inclusive window maps
+        // to a contiguous time-index range, found once by binary search.
+        let lo = times.partition_point(|&t| t < time.start) as u64;
+        let hi = times.partition_point(|&t| t <= time.end) as u64;
+        let table_len = times.len() as u64;
+
+        for (geometry_index, &masked) in mask.iter().enumerate() {
+            if !masked {
+                continue;
+            }
+            let id = geometry_index as u64;
+            let length = self.geometry[geometry_index];
+            let waves = block
+                .read_waves(&head, &positions, id, length)
+                .map_err(ReadError::Io)?;
+            let handle = FstSignalHandle::from_index(geometry_index);
+            for change in waves.iter() {
+                let (time_index, value) = change.map_err(ReadError::Io)?;
+                if time_index >= table_len {
+                    return Err(ReadError::Io(invalid_data("time index out of range")));
+                }
+                if time_index < lo || time_index >= hi {
+                    continue;
+                }
+                callback(times[time_index as usize], handle, value).map_err(ReadError::Callback)?;
+            }
+        }
+        Ok(())
+    }
 }
+
+/// An error from [`FstReader::read_value_changes`]: an I/O or parse error, or
+/// an error the caller's callback returned.
+#[derive(Debug)]
+pub enum ReadError<E> {
+    Io(std::io::Error),
+    Callback(E),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for ReadError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadError::Io(err) => write!(f, "{err}"),
+            ReadError::Callback(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl<E: std::fmt::Debug + std::fmt::Display> std::error::Error for ReadError<E> {}
 
 /// Dispatches one hierarchy entry to `callback` with the current scope stack,
 /// then updates the stack: a `Scope` is reported before it is pushed, an
