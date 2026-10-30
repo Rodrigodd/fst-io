@@ -2310,6 +2310,41 @@ struct BufferedChange {
 
 const NO_CHANGE: u32 = u32::MAX;
 
+/// What [`BlockBuffer`] needs of a signal on every change, kept together so
+/// that recording a change touches one entry.
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    /// Index in `changes` of the signal's last change, or [`NO_CHANGE`].
+    last_change: u32,
+    /// The length in bits, or [`SLOT_REAL`] or [`SLOT_VAR_LEN`].
+    width: u32,
+}
+
+const SLOT_REAL: u32 = u32::MAX;
+const SLOT_VAR_LEN: u32 = 0;
+
+impl Slot {
+    fn new(length: VariableLength) -> Slot {
+        let width = match length {
+            VariableLength::Bits(bits) => bits as u32,
+            VariableLength::Real => SLOT_REAL,
+            VariableLength::VarLen => SLOT_VAR_LEN,
+        };
+        Slot {
+            last_change: NO_CHANGE,
+            width,
+        }
+    }
+
+    fn length(self) -> VariableLength {
+        match self.width {
+            SLOT_REAL => VariableLength::Real,
+            SLOT_VAR_LEN => VariableLength::VarLen,
+            bits => VariableLength::Bits(u64::from(bits)),
+        }
+    }
+}
+
 const PLACEHOLDER_CHANGE: BufferedChange = BufferedChange {
     handle: 0,
     time_index: 0,
@@ -2336,8 +2371,7 @@ pub struct BlockBuffer {
     times: Vec<u64>,
     changes: Vec<BufferedChange>,
     payload: Vec<u8>,
-    /// Index in `changes` of each signal's last change, or [`NO_CHANGE`].
-    last_change: Vec<u32>,
+    slots: Vec<Slot>,
     /// The signals with a change in this block, in first-change order.
     changed: Vec<u32>,
 }
@@ -2350,7 +2384,11 @@ impl BlockBuffer {
         let mut frame = Vec::new();
         layout.initial_frame(&mut frame);
         Ok(BlockBuffer {
-            last_change: vec![NO_CHANGE; layout.geometry.len()],
+            slots: layout
+                .geometry
+                .iter()
+                .map(|&length| Slot::new(length))
+                .collect(),
             layout,
             first: true,
             frame,
@@ -2422,14 +2460,15 @@ impl BlockBuffer {
             .ok_or_else(|| invalid_input("block has no time step"))?;
 
         let n = self.layout.geometry.len();
-        if Arc::ptr_eq(&next.layout, &self.layout) && next.last_change.len() == n {
+        if Arc::ptr_eq(&next.layout, &self.layout) && next.slots.len() == n {
             for &handle in &next.changed {
-                next.last_change[handle as usize] = NO_CHANGE;
+                next.slots[handle as usize].last_change = NO_CHANGE;
             }
         } else {
             next.layout = Arc::clone(&self.layout);
-            next.last_change.clear();
-            next.last_change.resize(n, NO_CHANGE);
+            next.slots.clear();
+            next.slots
+                .extend(self.layout.geometry.iter().map(|&length| Slot::new(length)));
         }
         next.changed.clear();
         next.changes.clear();
@@ -2444,7 +2483,7 @@ impl BlockBuffer {
         for &handle in &self.changed {
             let handle = handle as usize;
             let length = self.layout.geometry[handle];
-            let change = self.changes[self.last_change[handle] as usize];
+            let change = self.changes[self.slots[handle].last_change as usize];
             let offset = self.layout.frame_offsets[handle];
             let packed = wave_value(change, &self.payload, length, &mut value);
             match length {
@@ -2467,16 +2506,15 @@ impl BlockBuffer {
 
     /// Checks that `handle` may change at `time_index` and returns its length.
     fn check(&self, handle: FstSignalHandle, time_index: usize) -> std::io::Result<VariableLength> {
-        let length = *self
-            .layout
-            .geometry
+        let slot = *self
+            .slots
             .get(handle.index())
             .ok_or_else(|| invalid_input("signal handle out of range"))?;
         let first_index = usize::from(!self.first);
         if time_index < first_index || time_index > self.current_index() {
             return Err(invalid_input("time index out of range"));
         }
-        let last = self.last_change[handle.index()];
+        let last = slot.last_change;
         // A change at the current time index is never out of order, so the
         // previous change is only read back from the log for an earlier one.
         if time_index != self.current_index()
@@ -2488,15 +2526,14 @@ impl BlockBuffer {
         if u32::try_from(self.changes.len() + 1).is_err() {
             return Err(invalid_input("too many changes in one block"));
         }
-        Ok(length)
+        Ok(slot.length())
     }
 
     /// Like [`check`](Self::check), for a change at the current time index,
     /// which needs no time-order check.
     fn check_current(&self, handle: FstSignalHandle) -> std::io::Result<VariableLength> {
-        let length = *self
-            .layout
-            .geometry
+        let slot = *self
+            .slots
             .get(handle.index())
             .ok_or_else(|| invalid_input("signal handle out of range"))?;
         if !self.has_time_step() && !self.first {
@@ -2505,7 +2542,7 @@ impl BlockBuffer {
         if self.changes.len() >= NO_CHANGE as usize {
             return Err(invalid_input("too many changes in one block"));
         }
-        Ok(length)
+        Ok(slot.length())
     }
 
     fn push(&mut self, handle: FstSignalHandle, time_index: usize, form: ChangeForm, data: u32) {
@@ -2516,11 +2553,11 @@ impl BlockBuffer {
             data,
             form,
         });
-        let last = &mut self.last_change[handle.index()];
-        if *last == NO_CHANGE {
+        let slot = &mut self.slots[handle.index()];
+        if slot.last_change == NO_CHANGE {
             self.changed.push(handle.index() as u32);
         }
-        *last = index;
+        slot.last_change = index;
     }
 
     fn push_payload(
