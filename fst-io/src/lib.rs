@@ -3955,6 +3955,39 @@ impl<W: Write + Seek + Send + 'static> FstValueWriter<W> {
         self.blackouts.push((time, active));
     }
 
+    /// Advances through several time steps at once and returns a
+    /// [`ColumnBlock`] to record their changes signal by signal, the way the
+    /// file stores them.
+    ///
+    /// `times` must be increasing and start at or after the current time; a
+    /// first time equal to the current time continues the current time step.
+    /// Moving to `times[0]` may seal the current block, as any time change
+    /// does; the rest of `times` then lands in one block. Changes recorded
+    /// through [`time`](Self::time) and `change*` afterwards happen at the
+    /// last of `times`.
+    pub fn block(&mut self, times: &[u64]) -> std::io::Result<ColumnBlock<'_, W>> {
+        if times.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(invalid_input("times must be increasing"));
+        }
+        let Some((&first, rest)) = times.split_first() else {
+            return Ok(ColumnBlock {
+                writer: self,
+                base: 0,
+                len: 0,
+            });
+        };
+        self.time(first)?;
+        let base = self.block.times().len() - 1;
+        for &time in rest {
+            self.block.push_time(time)?;
+        }
+        Ok(ColumnBlock {
+            writer: self,
+            base,
+            len: times.len(),
+        })
+    }
+
     /// Seals the current block at the next time change. Returns an error an
     /// encoder or writer thread met since the last call.
     pub fn flush(&mut self) -> std::io::Result<()> {
@@ -4015,6 +4048,38 @@ impl<W: Write + Seek + Send + 'static> Drop for FstValueWriter<W> {
         if self.output.is_some() {
             let _ = self.finish_file();
         }
+    }
+}
+
+/// Time steps added by [`FstValueWriter::block`], whose changes are given per
+/// signal.
+pub struct ColumnBlock<'a, W: Write + Seek + Send + 'static> {
+    writer: &'a mut FstValueWriter<W>,
+    /// Index in the block's time table of the first of these time steps.
+    base: usize,
+    len: usize,
+}
+
+impl<W: Write + Seek + Send + 'static> ColumnBlock<'_, W> {
+    /// Records changes of one signal as (index into the `times` given to
+    /// [`FstValueWriter::block`], value), in time order. A signal may be
+    /// given again with later changes; a later change at the same index
+    /// replaces the earlier one. A rejected change leaves the ones before it
+    /// recorded.
+    pub fn signal<'v>(
+        &mut self,
+        handle: FstSignalHandle,
+        changes: impl IntoIterator<Item = (usize, Value<'v>)>,
+    ) -> std::io::Result<()> {
+        for (index, value) in changes {
+            if index >= self.len {
+                return Err(invalid_input("time index out of range"));
+            }
+            self.writer
+                .block
+                .change_at(self.base + index, handle, value)?;
+        }
+        Ok(())
     }
 }
 

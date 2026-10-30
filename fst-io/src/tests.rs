@@ -2332,3 +2332,167 @@ fn a_panicking_writer_thread_is_returned_as_an_error() {
     let error = first_error(2, true);
     assert_eq!(error.to_string(), "an FST writer thread panicked");
 }
+
+/// The [`Value`] form of an expected ASCII change, owned by `bytes`.
+fn value_of(length: VariableLength, bytes: &[u8]) -> Value<'_> {
+    match length {
+        VariableLength::Bits(1) => Value::Bit(bytes[0]),
+        VariableLength::Bits(_) => Value::Ascii(bytes),
+        VariableLength::Real => Value::Real(bytes.try_into().unwrap()),
+        VariableLength::VarLen => Value::VarLen(bytes),
+    }
+}
+
+/// Time steps, and each signal's changes as (step, ASCII).
+type Chunk = (Vec<u64>, Vec<Vec<(usize, Vec<u8>)>>);
+
+#[test]
+fn column_blocks_write_the_same_file_as_the_row_api() {
+    use rand::{RngExt, SeedableRng};
+    for seed in 0..30 {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let geometry = random_geometry(&mut rng, 30);
+        let mut time = rng.random_range(0..10);
+        let chunks: Vec<Chunk> = (0..rng.random_range(1..8))
+            .map(|_| {
+                let times: Vec<u64> = (0..rng.random_range(1..20))
+                    .map(|_| {
+                        time += rng.random_range(1..30);
+                        time
+                    })
+                    .collect();
+                let changes = geometry
+                    .iter()
+                    .map(|&length| {
+                        let mut steps: Vec<usize> = (0..rng.random_range(0..times.len() + 1))
+                            .map(|_| rng.random_range(0..times.len()))
+                            .collect();
+                        steps.sort();
+                        steps.dedup();
+                        steps
+                            .into_iter()
+                            .map(|step| (step, random_input(&mut rng, length).1))
+                            .collect()
+                    })
+                    .collect();
+                (times, changes)
+            })
+            .collect();
+
+        let write = |column: bool| -> Vec<u8> {
+            let options = FstWriterOptions {
+                threads: if column { 2 } else { 0 },
+                ..FstWriterOptions::default()
+            };
+            let mut writer = memory_writer(options);
+            for (index, &length) in geometry.iter().enumerate() {
+                let (var_type, bits) = match length {
+                    VariableLength::Real => (VarType::Real, 64),
+                    VariableLength::VarLen => (VarType::String, 0),
+                    VariableLength::Bits(bits) => (VarType::Wire, bits as u32),
+                };
+                let name = format!("s{index}");
+                writer
+                    .var(var_type, VarDirection::Implicit, name.as_bytes(), bits)
+                    .unwrap();
+            }
+            let mut values = writer.into_values().unwrap();
+            for (chunk, (times, changes)) in chunks.iter().enumerate() {
+                if chunk > 0 {
+                    values.flush().unwrap();
+                }
+                if column {
+                    let mut block = values.block(times).unwrap();
+                    for (signal, changes) in changes.iter().enumerate() {
+                        let length = geometry[signal];
+                        let changes = changes
+                            .iter()
+                            .map(|(step, bytes)| (*step, value_of(length, bytes)));
+                        block.signal(handle(signal), changes).unwrap();
+                    }
+                } else {
+                    for (step, &time) in times.iter().enumerate() {
+                        values.time(time).unwrap();
+                        for (signal, changes) in changes.iter().enumerate() {
+                            for (_, bytes) in changes.iter().filter(|(s, _)| *s == step) {
+                                values
+                                    .change(handle(signal), value_of(geometry[signal], bytes))
+                                    .unwrap();
+                            }
+                        }
+                    }
+                }
+            }
+            values.finish().unwrap().into_inner()
+        };
+        let row = write(false);
+        let column = write(true);
+        assert!(row == column, "seed {seed}");
+        assert_eq!(
+            reader_of(column).header().num_vc_blocks,
+            chunks.len() as u64,
+            "seed {seed}"
+        );
+    }
+}
+
+#[test]
+fn column_block_continues_the_current_time_step_and_row_changes_follow_it() {
+    let mut writer = memory_writer(FstWriterOptions::default());
+    let a = writer
+        .var(VarType::Wire, VarDirection::Implicit, b"a", 1)
+        .unwrap();
+    let b = writer
+        .var(VarType::Wire, VarDirection::Implicit, b"b", 2)
+        .unwrap();
+    let mut values = writer.into_values().unwrap();
+    values.time(5).unwrap();
+    values.change_bit(a, true).unwrap();
+    let mut block = values.block(&[5, 8, 9]).unwrap();
+    block
+        .signal(b, [(0, Value::Ascii(b"01")), (2, Value::Ascii(b"10"))])
+        .unwrap();
+    block.signal(a, [(1, Value::Bit(b'0'))]).unwrap();
+    block.signal(a, [(1, Value::Bit(b'x'))]).unwrap();
+    values.change_bit(a, true).unwrap();
+    values.time(12).unwrap();
+    values.change_u64(b, 3).unwrap();
+
+    let changes = changes_of(&reader_of(values.finish().unwrap().into_inner()));
+    assert_eq!(
+        changes[0],
+        [(5, b"1".to_vec()), (8, b"x".to_vec()), (9, b"1".to_vec())]
+    );
+    assert_eq!(
+        changes[1],
+        [
+            (5, b"01".to_vec()),
+            (9, b"10".to_vec()),
+            (12, b"11".to_vec())
+        ]
+    );
+}
+
+#[test]
+fn column_blocks_reject_invalid_times_and_changes() {
+    let invalid = |result: std::io::Result<()>| {
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    };
+    let mut writer = memory_writer(FstWriterOptions::default());
+    let a = writer
+        .var(VarType::Wire, VarDirection::Implicit, b"a", 1)
+        .unwrap();
+    let mut values = writer.into_values().unwrap();
+    values.time(10).unwrap();
+    invalid(values.block(&[9, 11]).map(drop));
+    invalid(values.block(&[11, 11]).map(drop));
+    invalid(values.block(&[12, 11]).map(drop));
+
+    let mut block = values.block(&[20, 30]).unwrap();
+    invalid(block.signal(a, [(2, Value::Bit(b'1'))]));
+    invalid(block.signal(a, [(1, Value::Bit(b'1')), (0, Value::Bit(b'0'))]));
+    invalid(block.signal(a, [(0, Value::Ascii(b"10"))]));
+    let mut empty = values.block(&[]).unwrap();
+    invalid(empty.signal(a, [(0, Value::Bit(b'1'))]));
+    values.finish().unwrap();
+}
