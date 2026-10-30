@@ -2348,6 +2348,8 @@ struct Slot {
     last_change: u32,
     /// The length in bits, or [`SLOT_REAL`] or [`SLOT_VAR_LEN`].
     width: u32,
+    /// Number of changes of the signal in the block.
+    changes: u32,
 }
 
 const SLOT_REAL: u32 = u32::MAX;
@@ -2363,6 +2365,7 @@ impl Slot {
         Slot {
             last_change: NO_CHANGE,
             width,
+            changes: 0,
         }
     }
 
@@ -2491,7 +2494,9 @@ impl BlockBuffer {
         let n = self.layout.geometry.len();
         if Arc::ptr_eq(&next.layout, &self.layout) && next.slots.len() == n {
             for &handle in &next.changed {
-                next.slots[handle as usize].last_change = NO_CHANGE;
+                let slot = &mut next.slots[handle as usize];
+                slot.last_change = NO_CHANGE;
+                slot.changes = 0;
             }
         } else {
             next.layout = Arc::clone(&self.layout);
@@ -2587,6 +2592,7 @@ impl BlockBuffer {
             self.changed.push(handle.index() as u32);
         }
         slot.last_change = index;
+        slot.changes += 1;
     }
 
     fn push_payload(
@@ -3069,11 +3075,8 @@ impl BlockEncoder {
         let count = block.layout.geometry.len();
         self.starts.clear();
         self.starts.resize(count + 1, 0);
-        for change in &block.changes {
-            self.starts[change.handle() + 1] += 1;
-        }
-        for i in 0..count {
-            self.starts[i + 1] += self.starts[i];
+        for (i, slot) in block.slots.iter().enumerate() {
+            self.starts[i + 1] = self.starts[i] + slot.changes;
         }
         self.cursor.clear();
         self.cursor.extend_from_slice(&self.starts[..count]);
