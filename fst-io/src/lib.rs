@@ -2990,7 +2990,6 @@ pub struct BlockEncoder {
     stored_by_hash: std::collections::HashMap<u64, u32>,
     stored: Vec<StoredWave>,
     positions: Vec<WavePosition>,
-    pack: Vec<u8>,
     lz4: Vec<u8>,
     /// LZ4 hash tables for inputs shorter than 64 KiB and for longer ones,
     /// the split `lz4_flex::block::compress_into` makes.
@@ -3023,7 +3022,6 @@ impl BlockEncoder {
             stored_by_hash: std::collections::HashMap::new(),
             stored: Vec::new(),
             positions: Vec::new(),
-            pack: Vec::new(),
             lz4: Vec::new(),
             lz4_small: lz4_flex::block::CompressTable::small(),
             lz4_large: lz4_flex::block::CompressTable::large(),
@@ -3041,14 +3039,14 @@ impl BlockEncoder {
         let count = block.layout.geometry.len() as u64;
 
         self.sort(block);
-        let memory_required = self.encode_waves(block);
 
         out.clear();
         out.push(BlockType::ValueChangeDataDynamicAlias2 as u8);
         out.extend_from_slice(&[0; 8]);
         out.extend_from_slice(&start_time.to_be_bytes());
         out.extend_from_slice(&end_time.to_be_bytes());
-        out.extend_from_slice(&memory_required.to_be_bytes());
+        let memory_required_at = out.len();
+        out.extend_from_slice(&[0; 8]);
 
         let frame = zlib_if_smaller(&block.frame, 4, &mut self.zlib).unwrap_or(&block.frame);
         write_varint(out, block.frame.len() as u64);
@@ -3057,8 +3055,11 @@ impl BlockEncoder {
         out.extend_from_slice(frame);
 
         write_varint(out, count);
+        let pack_type_at = out.len();
         out.push(b'4');
-        out.extend_from_slice(&self.pack);
+        let memory_required = self.encode_waves(block, out, pack_type_at);
+        out[memory_required_at..memory_required_at + 8]
+            .copy_from_slice(&memory_required.to_be_bytes());
 
         let positions_start = out.len();
         write_positions(&self.positions, out);
@@ -3106,14 +3107,19 @@ impl BlockEncoder {
         }
     }
 
-    /// Builds and stores the waves of every signal into `pack`, fills
-    /// `positions`, and returns the total uncompressed wave length.
-    fn encode_waves(&mut self, block: &BlockBuffer) -> u64 {
+    /// Builds the waves of every signal and appends them to `pack`, the
+    /// section being encoded, whose pack type byte is at `pack_type_at`.
+    /// Fills `positions` and returns the total uncompressed wave length.
+    fn encode_waves(
+        &mut self,
+        block: &BlockBuffer,
+        pack: &mut Vec<u8>,
+        pack_type_at: usize,
+    ) -> u64 {
         self.waves.clear();
         self.stored_by_hash.clear();
         self.stored.clear();
         self.positions.clear();
-        self.pack.clear();
         let mut memory_required = 0u64;
 
         for signal in 0..block.layout.geometry.len() {
@@ -3160,7 +3166,7 @@ impl BlockEncoder {
             });
 
             // Offsets are relative to the pack type byte, which comes first.
-            let offset = 1 + self.pack.len() as u64;
+            let offset = (pack.len() - pack_type_at) as u64;
             self.positions
                 .push(WavePosition::Data { offset, length: 0 });
             let wave = &self.waves[start..end];
@@ -3177,13 +3183,13 @@ impl BlockEncoder {
                     lz4_flex::block::compress_into_with_table(wave, &mut self.lz4, table)
                         .expect("output is sized for the worst case");
                 if compressed < wave.len() {
-                    write_varint(&mut self.pack, wave.len() as u64);
-                    self.pack.extend_from_slice(&self.lz4[..compressed]);
+                    write_varint(pack, wave.len() as u64);
+                    pack.extend_from_slice(&self.lz4[..compressed]);
                     continue;
                 }
             }
-            write_varint(&mut self.pack, 0);
-            self.pack.extend_from_slice(wave);
+            write_varint(pack, 0);
+            pack.extend_from_slice(wave);
         }
         memory_required
     }
