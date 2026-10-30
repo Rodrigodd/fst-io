@@ -3137,8 +3137,16 @@ impl BlockEncoder {
 
             let hash = {
                 use std::hash::BuildHasher;
-                std::hash::BuildHasherDefault::<std::hash::DefaultHasher>::default()
-                    .hash_one(&self.waves[start..end])
+                // A sample of the wave is enough to tell most waves apart;
+                // equal hashes are confirmed by comparing the whole wave.
+                let wave = &self.waves[start..end];
+                let head = &wave[..wave.len().min(16)];
+                let tail = &wave[wave.len().saturating_sub(16)..];
+                std::hash::BuildHasherDefault::<std::hash::DefaultHasher>::default().hash_one((
+                    wave.len(),
+                    head,
+                    tail,
+                ))
             };
             let mut candidate = self.stored_by_hash.get(&hash).copied();
             while let Some(index) = candidate {
