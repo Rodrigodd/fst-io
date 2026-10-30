@@ -2244,7 +2244,7 @@ struct Layout {
 
 impl Layout {
     fn new(geometry: &[VariableLength]) -> std::io::Result<Layout> {
-        if u32::try_from(geometry.len()).is_err() {
+        if geometry.len() > HANDLE_MASK as usize {
             return Err(invalid_input("too many signals"));
         }
         let mut frame_offsets = Vec::with_capacity(geometry.len());
@@ -2300,12 +2300,42 @@ enum ChangeForm {
 
 #[derive(Debug, Clone, Copy)]
 struct BufferedChange {
-    handle: u32,
+    /// The signal's index in the low [`HANDLE_BITS`] bits, and the
+    /// [`ChangeForm`] above them.
+    handle_form: u32,
     time_index: u32,
     /// Offset of the value in the payload, or the value itself for
     /// [`ChangeForm::Bit`].
     data: u32,
-    form: ChangeForm,
+}
+
+const HANDLE_BITS: u32 = 29;
+const HANDLE_MASK: u32 = (1 << HANDLE_BITS) - 1;
+
+impl BufferedChange {
+    fn new(handle: u32, time_index: u32, form: ChangeForm, data: u32) -> BufferedChange {
+        BufferedChange {
+            handle_form: handle | (form as u32) << HANDLE_BITS,
+            time_index,
+            data,
+        }
+    }
+
+    fn handle(self) -> usize {
+        (self.handle_form & HANDLE_MASK) as usize
+    }
+
+    fn form(self) -> ChangeForm {
+        match self.handle_form >> HANDLE_BITS {
+            0 => ChangeForm::Bit,
+            1 => ChangeForm::Packed,
+            2 => ChangeForm::Ascii,
+            3 => ChangeForm::Le,
+            4 => ChangeForm::FourState,
+            5 => ChangeForm::Real,
+            _ => ChangeForm::VarLen,
+        }
+    }
 }
 
 const NO_CHANGE: u32 = u32::MAX;
@@ -2346,10 +2376,9 @@ impl Slot {
 }
 
 const PLACEHOLDER_CHANGE: BufferedChange = BufferedChange {
-    handle: 0,
+    handle_form: 0,
     time_index: 0,
     data: 0,
-    form: ChangeForm::Bit,
 };
 
 /// Everything one value-change section holds before encoding: the frame (the
@@ -2547,12 +2576,12 @@ impl BlockBuffer {
 
     fn push(&mut self, handle: FstSignalHandle, time_index: usize, form: ChangeForm, data: u32) {
         let index = self.changes.len() as u32;
-        self.changes.push(BufferedChange {
-            handle: handle.index() as u32,
-            time_index: time_index as u32,
-            data,
+        self.changes.push(BufferedChange::new(
+            handle.index() as u32,
+            time_index as u32,
             form,
-        });
+            data,
+        ));
         let slot = &mut self.slots[handle.index()];
         if slot.last_change == NO_CHANGE {
             self.changed.push(handle.index() as u32);
@@ -2826,7 +2855,7 @@ fn wave_value(
         _ => 0,
     };
     let len = bits.div_ceil(8);
-    match change.form {
+    match change.form() {
         ChangeForm::Bit => {
             out.push(change.data as u8);
             false
@@ -3041,7 +3070,7 @@ impl BlockEncoder {
         self.starts.clear();
         self.starts.resize(count + 1, 0);
         for change in &block.changes {
-            self.starts[change.handle as usize + 1] += 1;
+            self.starts[change.handle() + 1] += 1;
         }
         for i in 0..count {
             self.starts[i + 1] += self.starts[i];
@@ -3051,7 +3080,7 @@ impl BlockEncoder {
         self.order.clear();
         self.order.resize(block.changes.len(), PLACEHOLDER_CHANGE);
         for change in &block.changes {
-            let slot = &mut self.cursor[change.handle as usize];
+            let slot = &mut self.cursor[change.handle()];
             self.order[*slot as usize] = *change;
             *slot += 1;
         }
