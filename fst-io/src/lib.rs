@@ -3239,6 +3239,7 @@ impl BlockEncoder {
 
     /// [`write_wave`](Self::write_wave) for a 1-bit signal, whose changes all
     /// hold their ASCII byte inline.
+    #[inline(never)]
     fn write_bit_wave(
         &mut self,
         block: &BlockBuffer,
@@ -3282,6 +3283,7 @@ impl BlockEncoder {
 
     /// Appends the wave of `signal` to `waves`, from the changes at
     /// `order[changes]`.
+    #[inline(never)]
     fn write_wave(&mut self, block: &BlockBuffer, signal: usize, changes: std::ops::Range<usize>) {
         let length = block.layout.geometry[signal];
         if length == VariableLength::Bits(1) {
