@@ -2897,7 +2897,8 @@ fn wave_value(
             true
         }
         ChangeForm::Word => {
-            pack_le(&change.data.to_le_bytes()[..len], bits, out);
+            let left_aligned = u64::from(change.data) << (64 - bits);
+            out.extend_from_slice(&left_aligned.to_be_bytes()[..len]);
             true
         }
         ChangeForm::FourState => {
