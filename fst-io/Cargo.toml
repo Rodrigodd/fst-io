@@ -7,3 +7,6 @@ edition = "2024"
 fastlz-rs = "0.0.3"
 flate2 = "1.1.10"
 lz4_flex = { version = "0.14.0", default-features = false, features = ["safe-decode"] }
+
+[dev-dependencies]
+rand = "0.10.3"

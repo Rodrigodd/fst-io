@@ -2113,6 +2113,901 @@ impl Value<'_> {
     }
 }
 
+/// The signals of a design: their geometry and where each one's value sits in
+/// a block's frame.
+#[derive(Debug)]
+struct Layout {
+    geometry: Vec<VariableLength>,
+    frame_offsets: Vec<usize>,
+    frame_len: usize,
+}
+
+impl Layout {
+    fn new(geometry: &[VariableLength]) -> std::io::Result<Layout> {
+        if u32::try_from(geometry.len()).is_err() {
+            return Err(invalid_input("too many signals"));
+        }
+        let mut frame_offsets = Vec::with_capacity(geometry.len());
+        let mut frame_len = 0usize;
+        for &length in geometry {
+            frame_offsets.push(frame_len);
+            frame_len += match length {
+                VariableLength::Bits(bits) if (1..0xFFFF_FFFF).contains(&bits) => bits as usize,
+                VariableLength::Bits(_) => return Err(invalid_input("invalid signal length")),
+                VariableLength::Real => 8,
+                VariableLength::VarLen => 0,
+            };
+        }
+        Ok(Layout {
+            geometry: geometry.to_vec(),
+            frame_offsets,
+            frame_len,
+        })
+    }
+
+    /// The frame before any change: `x` for every bit and NaN for reals.
+    fn initial_frame(&self, frame: &mut Vec<u8>) {
+        frame.clear();
+        frame.resize(self.frame_len, b'x');
+        for (&length, &offset) in self.geometry.iter().zip(&self.frame_offsets) {
+            if length == VariableLength::Real {
+                frame[offset..offset + 8].copy_from_slice(&f64::NAN.to_le_bytes());
+            }
+        }
+    }
+}
+
+/// The form a buffered change was given in. Converting it to the form the
+/// file stores is left to the encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangeForm {
+    /// A 1-bit value; `data` is its ASCII byte.
+    Bit,
+    /// `ceil(n / 8)` bytes, most significant bit first.
+    Packed,
+    /// `n` ASCII bytes.
+    Ascii,
+    /// `ceil(n / 8)` bytes, least significant byte first.
+    Le,
+    /// Two `ceil(n / 8)` byte planes, least significant byte first: the
+    /// value bits, then the bits that are x or z.
+    FourState,
+    /// 8 bytes, little-endian.
+    Real,
+    /// A little-endian `u32` length, then the bytes.
+    VarLen,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BufferedChange {
+    handle: u32,
+    time_index: u32,
+    /// Offset of the value in the payload, or the value itself for
+    /// [`ChangeForm::Bit`].
+    data: u32,
+    form: ChangeForm,
+}
+
+const NO_CHANGE: u32 = u32::MAX;
+
+/// Everything one value-change section holds before encoding: the frame (the
+/// value of every signal at the block's first time), the time table, and the
+/// changes, kept in the form they were given.
+///
+/// The first block of a file is made by [`new`](Self::new); each later one is
+/// started from the block before it by [`start_next`](Self::start_next), so
+/// that it begins at the time the previous one ends and its frame holds the
+/// values the previous one left. Changes are recorded at the last time pushed
+/// (or, in the first block, before any time is pushed, at the first time).
+/// They are checked against the signal's length as they are recorded, so a
+/// block that was filled without error always encodes.
+#[derive(Debug)]
+pub struct BlockBuffer {
+    layout: Arc<Layout>,
+    first: bool,
+    frame: Vec<u8>,
+    times: Vec<u64>,
+    changes: Vec<BufferedChange>,
+    payload: Vec<u8>,
+    /// Index in `changes` of each signal's last change, or [`NO_CHANGE`].
+    last_change: Vec<u32>,
+    /// The signals with a change in this block, in first-change order.
+    changed: Vec<u32>,
+}
+
+impl BlockBuffer {
+    /// The first block of a file whose signals have the given geometry,
+    /// indexed by [`FstSignalHandle::index`].
+    pub fn new(geometry: &[VariableLength]) -> std::io::Result<BlockBuffer> {
+        let layout = Arc::new(Layout::new(geometry)?);
+        let mut frame = Vec::new();
+        layout.initial_frame(&mut frame);
+        Ok(BlockBuffer {
+            last_change: vec![NO_CHANGE; layout.geometry.len()],
+            layout,
+            first: true,
+            frame,
+            times: Vec::new(),
+            changes: Vec::new(),
+            payload: Vec::new(),
+            changed: Vec::new(),
+        })
+    }
+
+    /// The geometry the block was made for.
+    pub fn geometry(&self) -> &[VariableLength] {
+        &self.layout.geometry
+    }
+
+    /// The time table.
+    pub fn times(&self) -> &[u64] {
+        &self.times
+    }
+
+    pub fn start_time(&self) -> Option<u64> {
+        self.times.first().copied()
+    }
+
+    pub fn end_time(&self) -> Option<u64> {
+        self.times.last().copied()
+    }
+
+    /// Bytes buffered for the changes and the time table.
+    pub fn len_bytes(&self) -> usize {
+        self.changes.len() * std::mem::size_of::<BufferedChange>()
+            + self.payload.len()
+            + self.times.len() * 8
+    }
+
+    /// Whether the block holds a time step of its own: any time in the first
+    /// block, or one past the time a later block starts at.
+    pub fn has_time_step(&self) -> bool {
+        self.times.len() > usize::from(!self.first)
+    }
+
+    /// Starts a new time step. Pushing the last time again does nothing.
+    pub fn push_time(&mut self, time: u64) -> std::io::Result<()> {
+        match self.times.last() {
+            Some(&last) if time < last => Err(invalid_input("time goes backwards")),
+            Some(&last) if time == last => Ok(()),
+            _ => {
+                if u32::try_from(self.times.len()).is_err() {
+                    return Err(invalid_input("too many time steps in one block"));
+                }
+                self.times.push(time);
+                Ok(())
+            }
+        }
+    }
+
+    /// Resets `next` to the block that follows this one, reusing its
+    /// allocations: it starts at this block's end time, with this block's
+    /// final values as its frame.
+    pub fn start_next(&self, next: &mut BlockBuffer) -> std::io::Result<()> {
+        let end = self
+            .end_time()
+            .ok_or_else(|| invalid_input("block has no time step"))?;
+
+        let n = self.layout.geometry.len();
+        if Arc::ptr_eq(&next.layout, &self.layout) && next.last_change.len() == n {
+            for &handle in &next.changed {
+                next.last_change[handle as usize] = NO_CHANGE;
+            }
+        } else {
+            next.layout = Arc::clone(&self.layout);
+            next.last_change.clear();
+            next.last_change.resize(n, NO_CHANGE);
+        }
+        next.changed.clear();
+        next.changes.clear();
+        next.payload.clear();
+        next.times.clear();
+        next.times.push(end);
+        next.first = false;
+
+        next.frame.clear();
+        next.frame.extend_from_slice(&self.frame);
+        let mut value = Vec::new();
+        for &handle in &self.changed {
+            let handle = handle as usize;
+            let length = self.layout.geometry[handle];
+            let change = self.changes[self.last_change[handle] as usize];
+            let offset = self.layout.frame_offsets[handle];
+            let packed = wave_value(change, &self.payload, length, &mut value);
+            match length {
+                VariableLength::VarLen => {}
+                VariableLength::Bits(bits) if packed => {
+                    let frame = &mut next.frame[offset..offset + bits as usize];
+                    for (i, ascii) in frame.iter_mut().enumerate() {
+                        *ascii = b'0' | ((value[i / 8] >> (7 - i % 8)) & 1);
+                    }
+                }
+                _ => next.frame[offset..offset + value.len()].copy_from_slice(&value),
+            }
+        }
+        Ok(())
+    }
+
+    fn current_index(&self) -> usize {
+        self.times.len().saturating_sub(1)
+    }
+
+    /// Checks that `handle` may change at `time_index` and returns its length.
+    fn check(&self, handle: FstSignalHandle, time_index: usize) -> std::io::Result<VariableLength> {
+        let length = *self
+            .layout
+            .geometry
+            .get(handle.index())
+            .ok_or_else(|| invalid_input("signal handle out of range"))?;
+        let first_index = usize::from(!self.first);
+        if time_index < first_index || time_index > self.current_index() {
+            return Err(invalid_input("time index out of range"));
+        }
+        let last = self.last_change[handle.index()];
+        if last != NO_CHANGE && self.changes[last as usize].time_index as usize > time_index {
+            return Err(invalid_input("changes of a signal must be in time order"));
+        }
+        if u32::try_from(self.changes.len() + 1).is_err() {
+            return Err(invalid_input("too many changes in one block"));
+        }
+        Ok(length)
+    }
+
+    fn push(&mut self, handle: FstSignalHandle, time_index: usize, form: ChangeForm, data: u32) {
+        let index = self.changes.len() as u32;
+        self.changes.push(BufferedChange {
+            handle: handle.index() as u32,
+            time_index: time_index as u32,
+            data,
+            form,
+        });
+        let last = &mut self.last_change[handle.index()];
+        if *last == NO_CHANGE {
+            self.changed.push(handle.index() as u32);
+        }
+        *last = index;
+    }
+
+    fn push_payload(
+        &mut self,
+        handle: FstSignalHandle,
+        time_index: usize,
+        form: ChangeForm,
+        bytes: &[&[u8]],
+    ) -> std::io::Result<()> {
+        let offset =
+            u32::try_from(self.payload.len()).map_err(|_| invalid_input("block buffer is full"))?;
+        for part in bytes {
+            self.payload.extend_from_slice(part);
+        }
+        self.push(handle, time_index, form, offset);
+        Ok(())
+    }
+
+    fn push_bit(
+        &mut self,
+        handle: FstSignalHandle,
+        time_index: usize,
+        ascii: u8,
+    ) -> std::io::Result<()> {
+        let ascii = match ascii {
+            b'0' | b'1' | b'x' | b'z' | b'h' | b'u' | b'w' | b'l' | b'-' | b'?' => ascii,
+            b'X' | b'Z' | b'H' | b'U' | b'W' | b'L' => ascii.to_ascii_lowercase(),
+            _ => return Err(invalid_input("not a 1-bit value")),
+        };
+        self.push(handle, time_index, ChangeForm::Bit, u32::from(ascii));
+        Ok(())
+    }
+
+    /// Records a value of any form the reader yields. [`Value::Real`] bytes
+    /// are written as they are, so they must be little-endian.
+    pub fn change(&mut self, handle: FstSignalHandle, value: Value<'_>) -> std::io::Result<()> {
+        self.change_at(self.current_index(), handle, value)
+    }
+
+    /// Like [`change`](Self::change), at an earlier time step of this block:
+    /// `time_index` indexes [`times`](Self::times). A signal's changes must
+    /// be recorded in time order; a later change at the same time index
+    /// replaces the earlier one.
+    pub fn change_at(
+        &mut self,
+        time_index: usize,
+        handle: FstSignalHandle,
+        value: Value<'_>,
+    ) -> std::io::Result<()> {
+        let length = self.check(handle, time_index)?;
+        match (length, value) {
+            (VariableLength::Bits(1), Value::Bit(ascii) | Value::Ascii(&[ascii])) => {
+                self.push_bit(handle, time_index, ascii)
+            }
+            (
+                VariableLength::Bits(1),
+                Value::Packed {
+                    data: &[byte],
+                    bits: 1,
+                },
+            ) => self.push_bit(handle, time_index, b'0' | (byte >> 7)),
+            (VariableLength::Bits(n), Value::Packed { data, bits })
+                if bits as u64 == n && data.len() == bits.div_ceil(8) =>
+            {
+                self.push_payload(handle, time_index, ChangeForm::Packed, &[data])
+            }
+            (VariableLength::Bits(n), Value::Ascii(ascii)) if ascii.len() as u64 == n => {
+                self.push_payload(handle, time_index, ChangeForm::Ascii, &[ascii])
+            }
+            (VariableLength::Real, Value::Real(bytes)) => {
+                self.push_payload(handle, time_index, ChangeForm::Real, &[&bytes])
+            }
+            (VariableLength::VarLen, Value::VarLen(bytes)) => {
+                let len = u32::try_from(bytes.len())
+                    .map_err(|_| invalid_input("variable-length value too long"))?;
+                self.push_payload(
+                    handle,
+                    time_index,
+                    ChangeForm::VarLen,
+                    &[&len.to_le_bytes(), bytes],
+                )
+            }
+            _ => Err(invalid_input("value does not match the signal's length")),
+        }
+    }
+
+    /// Records a value of a 1-bit signal.
+    pub fn change_bit(&mut self, handle: FstSignalHandle, bit: bool) -> std::io::Result<()> {
+        let time_index = self.current_index();
+        match self.check(handle, time_index)? {
+            VariableLength::Bits(1) => self.push_bit(handle, time_index, b'0' | u8::from(bit)),
+            _ => Err(invalid_input("value does not match the signal's length")),
+        }
+    }
+
+    /// Records the low `n` bits of `value`, for an n-bit signal with
+    /// `n <= 64`.
+    pub fn change_u64(&mut self, handle: FstSignalHandle, value: u64) -> std::io::Result<()> {
+        self.change_le(handle, 64, &value.to_le_bytes(), None)
+    }
+
+    /// Records an n-bit value given as `ceil(n / 32)` words, least
+    /// significant word first, like Verilator's `VlWide` and libfst's
+    /// `fstWriterEmitValueChangeVec32`. Bits past `n` are ignored.
+    pub fn change_words32(
+        &mut self,
+        handle: FstSignalHandle,
+        words: &[u32],
+    ) -> std::io::Result<()> {
+        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        self.change_le(handle, 32, &bytes, None)
+    }
+
+    /// Like [`change_words32`](Self::change_words32), with 64-bit words.
+    pub fn change_words64(
+        &mut self,
+        handle: FstSignalHandle,
+        words: &[u64],
+    ) -> std::io::Result<()> {
+        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        self.change_le(handle, 64, &bytes, None)
+    }
+
+    /// Records a four-state value as VPI-style planes of 32-bit words, least
+    /// significant word first: each bit is 0 = (0, 0), 1 = (1, 0), z = (0, 1)
+    /// and x = (1, 1) in (`aval`, `bval`).
+    pub fn change_four_state(
+        &mut self,
+        handle: FstSignalHandle,
+        aval: &[u32],
+        bval: &[u32],
+    ) -> std::io::Result<()> {
+        let aval: Vec<u8> = aval.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let bval: Vec<u8> = bval.iter().flat_map(|word| word.to_le_bytes()).collect();
+        self.change_le(handle, 32, &aval, Some(&bval))
+    }
+
+    /// Records a value given as little-endian `word_bits`-bit words, with the
+    /// x/z plane of a four-state value.
+    fn change_le(
+        &mut self,
+        handle: FstSignalHandle,
+        word_bits: usize,
+        aval: &[u8],
+        bval: Option<&[u8]>,
+    ) -> std::io::Result<()> {
+        let time_index = self.current_index();
+        let VariableLength::Bits(n) = self.check(handle, time_index)? else {
+            return Err(invalid_input("value does not match the signal's length"));
+        };
+        let n = n as usize;
+        if aval.len() != n.div_ceil(word_bits) * word_bits / 8
+            || bval.is_some_and(|bval| bval.len() != aval.len())
+        {
+            return Err(invalid_input("value does not match the signal's length"));
+        }
+        if n == 1 {
+            let ascii = four_state_ascii(aval[0] & 1, bval.map_or(0, |bval| bval[0] & 1));
+            return self.push_bit(handle, time_index, ascii);
+        }
+        let len = n.div_ceil(8);
+        match bval {
+            None => self.push_payload(handle, time_index, ChangeForm::Le, &[&aval[..len]]),
+            Some(bval) => self.push_payload(
+                handle,
+                time_index,
+                ChangeForm::FourState,
+                &[&aval[..len], &bval[..len]],
+            ),
+        }
+    }
+
+    /// Records a real.
+    pub fn change_f64(&mut self, handle: FstSignalHandle, value: f64) -> std::io::Result<()> {
+        self.change(handle, Value::Real(value.to_le_bytes()))
+    }
+
+    /// Records a value with one ASCII byte per bit, of the signal's exact
+    /// width. A 1-bit value must be one of `01xzhuwl-?` (or upper case).
+    pub fn change_ascii(&mut self, handle: FstSignalHandle, ascii: &[u8]) -> std::io::Result<()> {
+        self.change(handle, Value::Ascii(ascii))
+    }
+
+    /// Records a value of a variable-length signal, such as a string.
+    pub fn change_var_len(&mut self, handle: FstSignalHandle, bytes: &[u8]) -> std::io::Result<()> {
+        self.change(handle, Value::VarLen(bytes))
+    }
+}
+
+/// The ASCII byte of a four-state bit given as its (aval, bval) pair.
+fn four_state_ascii(aval: u8, bval: u8) -> u8 {
+    match (aval, bval) {
+        (a, 0) => b'0' | a,
+        (0, _) => b'z',
+        _ => b'x',
+    }
+}
+
+/// Writes a buffered change into `out` in the form the waves store it: the
+/// ASCII byte of a 1-bit value, the packed bits (returning true) or ASCII
+/// bytes of a wider one, the 8 bytes of a real, or a variable-length value's
+/// bytes.
+///
+/// A value with only 0s and 1s is always packed, so two equal values give
+/// equal bytes whatever form they were given in.
+fn wave_value(
+    change: BufferedChange,
+    payload: &[u8],
+    length: VariableLength,
+    out: &mut Vec<u8>,
+) -> bool {
+    out.clear();
+    let start = change.data as usize;
+    let bits = match length {
+        VariableLength::Bits(bits) => bits as usize,
+        _ => 0,
+    };
+    let len = bits.div_ceil(8);
+    match change.form {
+        ChangeForm::Bit => {
+            out.push(change.data as u8);
+            false
+        }
+        ChangeForm::Real => {
+            out.extend_from_slice(&payload[start..start + 8]);
+            false
+        }
+        ChangeForm::VarLen => {
+            let len = u32::from_le_bytes(payload[start..start + 4].try_into().unwrap()) as usize;
+            out.extend_from_slice(&payload[start + 4..start + 4 + len]);
+            false
+        }
+        ChangeForm::Packed => {
+            out.extend_from_slice(&payload[start..start + len]);
+            if bits % 8 != 0 {
+                out[len - 1] &= 0xFF << (8 - bits % 8);
+            }
+            true
+        }
+        ChangeForm::Ascii => pack_ascii(&payload[start..start + bits], out),
+        ChangeForm::Le => {
+            pack_le(&payload[start..start + len], bits, out);
+            true
+        }
+        ChangeForm::FourState => {
+            let aval = &payload[start..start + len];
+            let bval = &payload[start + len..start + 2 * len];
+            let bit = |plane: &[u8], i: usize| (plane[i / 8] >> (i % 8)) & 1;
+            if (0..bits).all(|i| bit(bval, i) == 0) {
+                pack_le(aval, bits, out);
+                true
+            } else {
+                out.extend(
+                    (0..bits)
+                        .rev()
+                        .map(|i| four_state_ascii(bit(aval, i), bit(bval, i))),
+                );
+                false
+            }
+        }
+    }
+}
+
+/// Packs an ASCII value into `out` when it has only 0s and 1s, returning
+/// true, and copies it otherwise.
+fn pack_ascii(ascii: &[u8], out: &mut Vec<u8>) -> bool {
+    if !ascii.iter().all(|&b| b == b'0' || b == b'1') {
+        out.extend_from_slice(ascii);
+        return false;
+    }
+    let start = out.len();
+    out.resize(start + ascii.len().div_ceil(8), 0);
+    for (i, &b) in ascii.iter().enumerate() {
+        out[start + i / 8] |= (b & 1) << (7 - i % 8);
+    }
+    true
+}
+
+/// Packs the low `bits` bits of a little-endian value, most significant bit
+/// first, into `ceil(bits / 8)` bytes, left-aligned in the last byte.
+fn pack_le(le: &[u8], bits: usize, out: &mut Vec<u8>) {
+    let len = bits.div_ceil(8);
+    let pad = len * 8 - bits;
+    for k in (0..len).rev() {
+        let low = if pad != 0 && k > 0 {
+            le[k - 1] >> (8 - pad)
+        } else {
+            0
+        };
+        out.push((le[k] << pad) | low);
+    }
+}
+
+/// How the waves of a value-change block are compressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WaveCompression {
+    /// LZ4, for each wave that it shrinks.
+    #[default]
+    Lz4,
+    /// Every wave is stored raw.
+    None,
+}
+
+/// Options of [`BlockEncoder`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EncodeOptions {
+    /// Drop a change equal to the signal's previous value. Changes at the
+    /// file's first time step are always kept, so it lists every signal set
+    /// there. Variable-length values are never dropped.
+    pub deduplicate: bool,
+    pub wave_compression: WaveCompression,
+}
+
+/// Encodes [`BlockBuffer`]s as value-change sections, reusing its scratch
+/// buffers from one block to the next.
+///
+/// The bytes depend only on the block and the options, so blocks may be
+/// encoded on any thread and in any order.
+pub struct BlockEncoder {
+    options: EncodeOptions,
+    /// `order[starts[i]..starts[i + 1]]` are the changes of signal `i`.
+    starts: Vec<u32>,
+    cursor: Vec<u32>,
+    /// Change indices, grouped by signal and in time order within each.
+    order: Vec<u32>,
+    value: Vec<u8>,
+    previous: Vec<u8>,
+    /// The uncompressed waves stored so far, to find dynamic aliases.
+    waves: Vec<u8>,
+    /// Hash of a wave to the last entry of `stored` with that hash.
+    stored_by_hash: std::collections::HashMap<u64, u32>,
+    stored: Vec<StoredWave>,
+    positions: Vec<WavePosition>,
+    pack: Vec<u8>,
+    lz4: Vec<u8>,
+    zlib: Vec<u8>,
+    table: Vec<u8>,
+}
+
+/// A wave stored in the block, for dynamic alias lookup.
+struct StoredWave {
+    signal: u32,
+    /// Range in [`BlockEncoder::waves`].
+    start: usize,
+    end: usize,
+    /// The previous entry with the same hash, or [`NO_CHANGE`].
+    next: u32,
+}
+
+impl BlockEncoder {
+    pub fn new(options: EncodeOptions) -> BlockEncoder {
+        BlockEncoder {
+            options,
+            starts: Vec::new(),
+            cursor: Vec::new(),
+            order: Vec::new(),
+            value: Vec::new(),
+            previous: Vec::new(),
+            waves: Vec::new(),
+            stored_by_hash: std::collections::HashMap::new(),
+            stored: Vec::new(),
+            positions: Vec::new(),
+            pack: Vec::new(),
+            lz4: Vec::new(),
+            zlib: Vec::new(),
+            table: Vec::new(),
+        }
+    }
+
+    /// Encodes `block` as a complete FST_BL_VCDATA_DYN_ALIAS2 section (block
+    /// type, length and data) into `out`, replacing its contents.
+    pub fn encode(&mut self, block: &BlockBuffer, out: &mut Vec<u8>) -> std::io::Result<()> {
+        let (Some(start_time), Some(end_time)) = (block.start_time(), block.end_time()) else {
+            return Err(invalid_input("block has no time step"));
+        };
+        let count = block.layout.geometry.len() as u64;
+
+        self.sort(block);
+        let memory_required = self.encode_waves(block);
+
+        out.clear();
+        out.push(BlockType::ValueChangeDataDynamicAlias2 as u8);
+        out.extend_from_slice(&[0; 8]);
+        out.extend_from_slice(&start_time.to_be_bytes());
+        out.extend_from_slice(&end_time.to_be_bytes());
+        out.extend_from_slice(&memory_required.to_be_bytes());
+
+        let frame = zlib_if_smaller(&block.frame, 4, &mut self.zlib).unwrap_or(&block.frame);
+        write_varint(out, block.frame.len() as u64);
+        write_varint(out, frame.len() as u64);
+        write_varint(out, count);
+        out.extend_from_slice(frame);
+
+        write_varint(out, count);
+        out.push(b'4');
+        out.extend_from_slice(&self.pack);
+
+        let positions_start = out.len();
+        write_positions(&self.positions, out);
+        let positions_length = (out.len() - positions_start) as u64;
+        out.extend_from_slice(&positions_length.to_be_bytes());
+
+        self.table.clear();
+        let mut previous = 0;
+        for &time in &block.times {
+            write_varint(&mut self.table, time - previous);
+            previous = time;
+        }
+        let times = zlib_if_smaller(&self.table, 9, &mut self.zlib).unwrap_or(&self.table);
+        out.extend_from_slice(times);
+        out.extend_from_slice(&(self.table.len() as u64).to_be_bytes());
+        out.extend_from_slice(&(times.len() as u64).to_be_bytes());
+        out.extend_from_slice(&(block.times.len() as u64).to_be_bytes());
+
+        // The section length includes its own 8-byte length field.
+        let len = (out.len() - 1) as u64;
+        out[1..9].copy_from_slice(&len.to_be_bytes());
+        Ok(())
+    }
+
+    /// Counting sort of the block's changes by signal, which keeps them in
+    /// time order within each signal.
+    fn sort(&mut self, block: &BlockBuffer) {
+        let count = block.layout.geometry.len();
+        self.starts.clear();
+        self.starts.resize(count + 1, 0);
+        for change in &block.changes {
+            self.starts[change.handle as usize + 1] += 1;
+        }
+        for i in 0..count {
+            self.starts[i + 1] += self.starts[i];
+        }
+        self.cursor.clear();
+        self.cursor.extend_from_slice(&self.starts[..count]);
+        self.order.clear();
+        self.order.resize(block.changes.len(), 0);
+        for (index, change) in block.changes.iter().enumerate() {
+            let slot = &mut self.cursor[change.handle as usize];
+            self.order[*slot as usize] = index as u32;
+            *slot += 1;
+        }
+    }
+
+    /// Builds and stores the waves of every signal into `pack`, fills
+    /// `positions`, and returns the total uncompressed wave length.
+    fn encode_waves(&mut self, block: &BlockBuffer) -> u64 {
+        self.waves.clear();
+        self.stored_by_hash.clear();
+        self.stored.clear();
+        self.positions.clear();
+        self.pack.clear();
+        let mut memory_required = 0u64;
+
+        for signal in 0..block.layout.geometry.len() {
+            let start = self.waves.len();
+            let changes = self.starts[signal] as usize..self.starts[signal + 1] as usize;
+            if !changes.is_empty() {
+                self.write_wave(block, signal, changes);
+            }
+            let end = self.waves.len();
+            if start == end {
+                self.positions.push(WavePosition::None);
+                continue;
+            }
+            memory_required += (end - start) as u64;
+
+            let hash = {
+                use std::hash::BuildHasher;
+                std::hash::BuildHasherDefault::<std::hash::DefaultHasher>::default()
+                    .hash_one(&self.waves[start..end])
+            };
+            let mut candidate = self.stored_by_hash.get(&hash).copied();
+            while let Some(index) = candidate {
+                let stored = &self.stored[index as usize];
+                if self.waves[stored.start..stored.end] == self.waves[start..end] {
+                    break;
+                }
+                candidate = (stored.next != NO_CHANGE).then_some(stored.next);
+            }
+            if let Some(index) = candidate {
+                let target = self.stored[index as usize].signal;
+                self.positions.push(WavePosition::Alias(u64::from(target)));
+                self.waves.truncate(start);
+                continue;
+            }
+            let next = self
+                .stored_by_hash
+                .insert(hash, self.stored.len() as u32)
+                .unwrap_or(NO_CHANGE);
+            self.stored.push(StoredWave {
+                signal: signal as u32,
+                start,
+                end,
+                next,
+            });
+
+            // Offsets are relative to the pack type byte, which comes first.
+            let offset = 1 + self.pack.len() as u64;
+            self.positions
+                .push(WavePosition::Data { offset, length: 0 });
+            let wave = &self.waves[start..end];
+            if self.options.wave_compression == WaveCompression::Lz4 && wave.len() > 32 {
+                self.lz4.clear();
+                self.lz4
+                    .resize(lz4_flex::block::get_maximum_output_size(wave.len()), 0);
+                let compressed = lz4_flex::block::compress_into(wave, &mut self.lz4)
+                    .expect("output is sized for the worst case");
+                if compressed < wave.len() {
+                    write_varint(&mut self.pack, wave.len() as u64);
+                    self.pack.extend_from_slice(&self.lz4[..compressed]);
+                    continue;
+                }
+            }
+            write_varint(&mut self.pack, 0);
+            self.pack.extend_from_slice(wave);
+        }
+        memory_required
+    }
+
+    /// Appends the wave of `signal` to `waves`, from the changes at
+    /// `order[changes]`.
+    fn write_wave(&mut self, block: &BlockBuffer, signal: usize, changes: std::ops::Range<usize>) {
+        let length = block.layout.geometry[signal];
+        let dedup = self.options.deduplicate && length != VariableLength::VarLen;
+        if dedup {
+            let offset = block.layout.frame_offsets[signal];
+            self.previous.clear();
+            match length {
+                VariableLength::Bits(1) => self.previous.push(block.frame[offset]),
+                VariableLength::Bits(bits) => {
+                    let ascii = &block.frame[offset..offset + bits as usize];
+                    pack_ascii(ascii, &mut self.previous);
+                }
+                _ => self
+                    .previous
+                    .extend_from_slice(&block.frame[offset..offset + 8]),
+            }
+        }
+
+        let mut previous_index = 0u64;
+        let order = &self.order[changes];
+        for (i, &index) in order.iter().enumerate() {
+            let change = block.changes[index as usize];
+            if let Some(&next) = order.get(i + 1)
+                && block.changes[next as usize].time_index == change.time_index
+            {
+                continue;
+            }
+            let packed = wave_value(change, &block.payload, length, &mut self.value);
+            let at_first_step = block.first && change.time_index == 0;
+            if dedup && !at_first_step && self.value == self.previous {
+                continue;
+            }
+
+            let time_index = u64::from(change.time_index);
+            let delta = time_index - previous_index;
+            previous_index = time_index;
+            let waves = &mut self.waves;
+            match length {
+                VariableLength::Bits(1) => {
+                    let ascii = self.value[0];
+                    if ascii == b'0' || ascii == b'1' {
+                        write_varint(waves, delta << 2 | u64::from(ascii & 1) << 1);
+                    } else {
+                        let code = ONE_BIT_VALUES
+                            .iter()
+                            .position(|&v| v == ascii)
+                            .expect("checked when recorded")
+                            as u64;
+                        write_varint(waves, delta << 4 | code << 1 | 1);
+                    }
+                }
+                VariableLength::Bits(_) => {
+                    write_varint(waves, delta << 1 | u64::from(!packed));
+                    waves.extend_from_slice(&self.value);
+                }
+                VariableLength::Real => {
+                    write_varint(waves, delta << 1 | 1);
+                    waves.extend_from_slice(&self.value);
+                }
+                VariableLength::VarLen => {
+                    write_varint(waves, delta << 1);
+                    write_varint(waves, self.value.len() as u64);
+                    waves.extend_from_slice(&self.value);
+                }
+            }
+            if dedup {
+                std::mem::swap(&mut self.value, &mut self.previous);
+            }
+        }
+    }
+}
+
+/// Writes the position table of a FST_BL_VCDATA_DYN_ALIAS2 block, the inverse
+/// of [`decode_positions_alias2`].
+fn write_positions(positions: &[WavePosition], out: &mut Vec<u8>) {
+    let mut zeros = 0u64;
+    let mut previous_offset = 0u64;
+    let mut previous_alias = None;
+    for &position in positions {
+        let entry = match position {
+            WavePosition::None => {
+                zeros += 1;
+                continue;
+            }
+            WavePosition::Data { offset, .. } => {
+                let delta = (offset - previous_offset) as i64;
+                previous_offset = offset;
+                delta << 1 | 1
+            }
+            WavePosition::Alias(id) => {
+                let alias = -(id as i64 + 1);
+                if previous_alias == Some(alias) {
+                    1
+                } else {
+                    previous_alias = Some(alias);
+                    alias << 1 | 1
+                }
+            }
+        };
+        if zeros != 0 {
+            write_varint(out, zeros << 1);
+            zeros = 0;
+        }
+        write_svarint(out, entry);
+    }
+    if zeros != 0 {
+        write_varint(out, zeros << 1);
+    }
+}
+
+/// Compresses `data` with zlib at `level` into `scratch` and returns it when
+/// strictly smaller: readers take equal lengths to mean the data is raw.
+fn zlib_if_smaller<'a>(data: &[u8], level: u32, scratch: &'a mut Vec<u8>) -> Option<&'a [u8]> {
+    scratch.clear();
+    let mut encoder =
+        flate2::write::ZlibEncoder::new(std::mem::take(scratch), flate2::Compression::new(level));
+    encoder.write_all(data).ok()?;
+    *scratch = encoder.finish().ok()?;
+    (scratch.len() < data.len()).then_some(&scratch[..])
+}
+
 fn real_to_f64(bytes: [u8; 8], endianness: RealEndianess) -> f64 {
     match endianness {
         RealEndianess::LittleEndian => f64::from_le_bytes(bytes),
@@ -2217,6 +3112,19 @@ fn read_svarint<R: Read>(reader: &mut R) -> std::io::Result<i64> {
     }
 }
 
+/// Appends `value` as a signed LEB128 varint, the inverse of [`read_svarint`].
+fn write_svarint(out: &mut Vec<u8>, mut value: i64) {
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0) {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
 fn checked_add(a: u64, b: u64) -> std::io::Result<u64> {
     a.checked_add(b)
         .ok_or_else(|| invalid_data("offset overflows u64"))
@@ -2228,6 +3136,10 @@ fn to_usize(value: u64) -> std::io::Result<usize> {
 
 fn invalid_data(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
+}
+
+fn invalid_input(msg: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, msg)
 }
 
 /// Decompressed FST payloads at or above this size are staged in a temp file

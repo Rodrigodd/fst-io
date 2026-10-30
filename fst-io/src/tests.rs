@@ -1131,3 +1131,534 @@ fn to_geometry_is_read_back_by_geometry_lengths() {
     let read: Vec<_> = geometry.lengths().map(Result::unwrap).collect();
     assert_eq!(read, lengths);
 }
+
+/// A value-change section decoded with the block readers.
+struct DecodedBlock {
+    block_type: BlockType,
+    start_time: u64,
+    end_time: u64,
+    memory_required: u64,
+    times: Vec<u64>,
+    /// The frame value of each signal, as ASCII (raw bytes for reals).
+    frame: Vec<Vec<u8>>,
+    positions: Vec<WavePosition>,
+    /// Each signal's changes, as (time index, ASCII).
+    changes: Vec<Vec<(u64, Vec<u8>)>>,
+    tail: TailLayout,
+    head: HeadLayout,
+}
+
+fn decode_block(section: &[u8], geometry: &[VariableLength]) -> DecodedBlock {
+    let mut iterator = SectionIterator::new(std::io::Cursor::new(section.to_vec()));
+    let section = iterator.next().unwrap().unwrap().buffer().unwrap();
+    assert!(iterator.next().unwrap().is_none());
+    let mut block = section.read_value_changes().unwrap();
+    let head = block.read_head_layout().unwrap();
+    let tail = block.read_tail_layout().unwrap();
+    let positions = block.read_positions(&head, &tail).unwrap();
+    let times = block.read_time_table(&tail).unwrap();
+    let bits = block.read_bits(&head).unwrap();
+    let frame = bits
+        .values(geometry)
+        .map(|value| value.unwrap().to_ascii())
+        .collect();
+    let changes = (0..geometry.len())
+        .map(|id| {
+            let waves = block
+                .read_waves(&head, &positions, id as u64, geometry[id])
+                .unwrap();
+            waves
+                .iter()
+                .map(|change| {
+                    let (index, value) = change.unwrap();
+                    (index, value.to_ascii())
+                })
+                .collect()
+        })
+        .collect();
+    DecodedBlock {
+        block_type: block.block_type,
+        start_time: block.start_time,
+        end_time: block.end_time,
+        memory_required: block.memory_required,
+        times,
+        frame,
+        positions,
+        changes,
+        tail,
+        head,
+    }
+}
+
+fn encode_block(block: &BlockBuffer, options: EncodeOptions) -> Vec<u8> {
+    let mut out = Vec::new();
+    BlockEncoder::new(options).encode(block, &mut out).unwrap();
+    out
+}
+
+fn handle(index: usize) -> FstSignalHandle {
+    FstSignalHandle::from_index(index)
+}
+
+fn ascii_changes(changes: &[(u64, &str)]) -> Vec<(u64, Vec<u8>)> {
+    changes
+        .iter()
+        .map(|&(index, value)| (index, value.as_bytes().to_vec()))
+        .collect()
+}
+
+#[test]
+fn encoded_block_is_read_back_by_the_block_readers() {
+    let geometry = [
+        VariableLength::Bits(1),
+        VariableLength::Bits(4),
+        VariableLength::Real,
+        VariableLength::VarLen,
+        VariableLength::Bits(70),
+    ];
+    let mut block = BlockBuffer::new(&geometry).unwrap();
+    block.change_bit(handle(0), false).unwrap();
+    block.push_time(10).unwrap();
+    block.change_ascii(handle(1), b"10x1").unwrap();
+    block.change_f64(handle(2), 1.5).unwrap();
+    block.push_time(15).unwrap();
+    block.change(handle(0), Value::Bit(b'z')).unwrap();
+    block.change_var_len(handle(3), b"hello").unwrap();
+    block.change_u64(handle(1), 0b0110).unwrap();
+    block.push_time(15).unwrap();
+    block.push_time(40).unwrap();
+    block
+        .change_words32(handle(4), &[1, 0, 0b110_0000])
+        .unwrap();
+    block.change_bit(handle(0), true).unwrap();
+
+    let decoded = decode_block(&encode_block(&block, EncodeOptions::default()), &geometry);
+    assert_eq!(decoded.block_type, BlockType::ValueChangeDataDynamicAlias2);
+    assert_eq!((decoded.start_time, decoded.end_time), (10, 40));
+    assert_eq!(decoded.times, [10, 15, 40]);
+    assert_eq!(decoded.frame[0], b"x");
+    assert_eq!(decoded.frame[1], b"xxxx");
+    assert!(f64::from_le_bytes(decoded.frame[2][..].try_into().unwrap()).is_nan());
+    assert_eq!(
+        decoded.changes[0],
+        ascii_changes(&[(0, "0"), (1, "z"), (2, "1")])
+    );
+    assert_eq!(
+        decoded.changes[1],
+        ascii_changes(&[(0, "10x1"), (1, "0110")])
+    );
+    assert_eq!(decoded.changes[2], [(0, 1.5f64.to_le_bytes().to_vec())]);
+    assert_eq!(decoded.changes[3], ascii_changes(&[(1, "hello")]));
+    let mut wide = vec![b'0'; 70];
+    wide[0] = b'1';
+    wide[69] = b'1';
+    assert_eq!(decoded.changes[4], [(2, wide)]);
+}
+
+#[test]
+fn every_input_form_records_the_same_wide_value() {
+    let geometry = [VariableLength::Bits(40)];
+    let value: u64 = 0x12_89AB_CDEF;
+    let expected = format!("{value:040b}");
+    let packed: Vec<u8> = (value << 24).to_be_bytes()[..5].to_vec();
+
+    let mut block = BlockBuffer::new(&geometry).unwrap();
+    let high = (value >> 32) as u32;
+    block.push_time(0).unwrap();
+    block.change_u64(handle(0), value | 0xFF << 56).unwrap();
+    block.push_time(1).unwrap();
+    block
+        .change_words32(handle(0), &[value as u32, high | 0xF00])
+        .unwrap();
+    block.push_time(2).unwrap();
+    block.change_words64(handle(0), &[value]).unwrap();
+    block.push_time(3).unwrap();
+    block
+        .change_four_state(handle(0), &[value as u32, high], &[0, 0x100])
+        .unwrap();
+    block.push_time(4).unwrap();
+    block
+        .change(
+            handle(0),
+            Value::Packed {
+                data: &packed,
+                bits: 40,
+            },
+        )
+        .unwrap();
+    block.push_time(5).unwrap();
+    block.change_ascii(handle(0), expected.as_bytes()).unwrap();
+
+    let decoded = decode_block(&encode_block(&block, EncodeOptions::default()), &geometry);
+    let values: Vec<_> = decoded.changes[0].iter().map(|(_, v)| v.clone()).collect();
+    assert!(
+        values.iter().all(|v| v == expected.as_bytes()),
+        "{values:?}"
+    );
+    assert_eq!(values.len(), 6);
+}
+
+#[test]
+fn four_state_planes_map_to_01zx() {
+    let geometry = [VariableLength::Bits(4), VariableLength::Bits(1)];
+    let mut block = BlockBuffer::new(&geometry).unwrap();
+    block.push_time(0).unwrap();
+    block
+        .change_four_state(handle(0), &[0b1010], &[0b1100])
+        .unwrap();
+    block.change_four_state(handle(1), &[0], &[1]).unwrap();
+
+    let decoded = decode_block(&encode_block(&block, EncodeOptions::default()), &geometry);
+    assert_eq!(decoded.changes[0], ascii_changes(&[(0, "xz10")]));
+    assert_eq!(decoded.changes[1], ascii_changes(&[(0, "z")]));
+}
+
+#[test]
+fn a_later_change_at_the_same_time_replaces_the_earlier_one() {
+    let geometry = [VariableLength::Bits(8)];
+    let mut block = BlockBuffer::new(&geometry).unwrap();
+    block.push_time(5).unwrap();
+    block.change_u64(handle(0), 1).unwrap();
+    block.change_u64(handle(0), 2).unwrap();
+    block.push_time(6).unwrap();
+    block.change_u64(handle(0), 3).unwrap();
+
+    let decoded = decode_block(&encode_block(&block, EncodeOptions::default()), &geometry);
+    assert_eq!(
+        decoded.changes[0],
+        ascii_changes(&[(0, "00000010"), (1, "00000011")])
+    );
+}
+
+#[test]
+fn deduplicate_drops_repeats_except_at_the_first_time_step() {
+    let geometry = [
+        VariableLength::Bits(1),
+        VariableLength::Bits(3),
+        VariableLength::VarLen,
+    ];
+    let mut block = BlockBuffer::new(&geometry).unwrap();
+    block.push_time(0).unwrap();
+    block.change_ascii(handle(0), b"x").unwrap();
+    block.change_ascii(handle(1), b"101").unwrap();
+    block.change_var_len(handle(2), b"a").unwrap();
+    for time in 1..4 {
+        block.push_time(time).unwrap();
+        block.change_ascii(handle(0), b"x").unwrap();
+        block.change_u64(handle(1), 0b101).unwrap();
+        block.change_var_len(handle(2), b"a").unwrap();
+    }
+    block.push_time(4).unwrap();
+    block.change_bit(handle(0), true).unwrap();
+    block.change_u64(handle(1), 0).unwrap();
+
+    let options = EncodeOptions {
+        deduplicate: true,
+        ..EncodeOptions::default()
+    };
+    let decoded = decode_block(&encode_block(&block, options), &geometry);
+    assert_eq!(decoded.changes[0], ascii_changes(&[(0, "x"), (4, "1")]));
+    assert_eq!(decoded.changes[1], ascii_changes(&[(0, "101"), (4, "000")]));
+    assert_eq!(
+        decoded.changes[2],
+        ascii_changes(&[(0, "a"), (1, "a"), (2, "a"), (3, "a")])
+    );
+
+    let mut next = BlockBuffer::new(&geometry).unwrap();
+    block.start_next(&mut next).unwrap();
+    next.push_time(5).unwrap();
+    next.change_bit(handle(0), true).unwrap();
+    next.change_ascii(handle(1), b"001").unwrap();
+    let decoded = decode_block(&encode_block(&next, options), &geometry);
+    assert_eq!(decoded.changes[0], []);
+    assert_eq!(decoded.changes[1], ascii_changes(&[(1, "001")]));
+}
+
+#[test]
+fn identical_waves_become_dynamic_aliases() {
+    let geometry = [VariableLength::Bits(1); 5];
+    let mut block = BlockBuffer::new(&geometry).unwrap();
+    for time in 0..4 {
+        block.push_time(time).unwrap();
+        let bit = time % 2 == 0;
+        block.change_bit(handle(0), bit).unwrap();
+        block.change_bit(handle(1), !bit).unwrap();
+        block.change_bit(handle(2), bit).unwrap();
+        block.change_bit(handle(4), bit).unwrap();
+    }
+
+    let decoded = decode_block(&encode_block(&block, EncodeOptions::default()), &geometry);
+    assert!(matches!(decoded.positions[0], WavePosition::Data { .. }));
+    assert!(matches!(decoded.positions[1], WavePosition::Data { .. }));
+    assert_eq!(decoded.positions[2], WavePosition::Alias(0));
+    assert_eq!(decoded.positions[3], WavePosition::None);
+    assert_eq!(decoded.positions[4], WavePosition::Alias(0));
+    assert_eq!(decoded.changes[4], decoded.changes[0]);
+    // Each wave is 4 single-byte entries; the aliases are counted too.
+    assert_eq!(decoded.memory_required, 4 * 4);
+}
+
+#[test]
+fn start_next_frame_holds_the_final_values_of_the_previous_block() {
+    let geometry = [
+        VariableLength::Bits(1),
+        VariableLength::Bits(12),
+        VariableLength::Real,
+        VariableLength::VarLen,
+        VariableLength::Bits(2),
+    ];
+    let mut block = BlockBuffer::new(&geometry).unwrap();
+    block.push_time(3).unwrap();
+    block.change_bit(handle(0), true).unwrap();
+    block.change_u64(handle(1), 0xABC).unwrap();
+    block.change_var_len(handle(3), b"s").unwrap();
+    block.push_time(8).unwrap();
+    block.change_f64(handle(2), -2.0).unwrap();
+    block.change_ascii(handle(1), b"0000zzzz1111").unwrap();
+
+    let mut next = BlockBuffer::new(&[VariableLength::Bits(1)]).unwrap();
+    block.start_next(&mut next).unwrap();
+    assert_eq!(next.times(), [8]);
+    assert!(!next.has_time_step());
+    next.push_time(9).unwrap();
+
+    let decoded = decode_block(&encode_block(&next, EncodeOptions::default()), &geometry);
+    assert_eq!(decoded.start_time, 8);
+    assert_eq!(decoded.times, [8, 9]);
+    assert_eq!(decoded.frame[0], b"1");
+    assert_eq!(decoded.frame[1], b"0000zzzz1111");
+    assert_eq!(decoded.frame[2], (-2.0f64).to_le_bytes());
+    assert_eq!(decoded.frame[4], b"xx");
+}
+
+#[test]
+fn long_waves_are_lz4_compressed_when_it_shrinks_them() {
+    let geometry = [VariableLength::Bits(64), VariableLength::Bits(64)];
+    let mut block = BlockBuffer::new(&geometry).unwrap();
+    for time in 0..100 {
+        block.push_time(time).unwrap();
+        block.change_u64(handle(0), time % 2).unwrap();
+        block
+            .change_u64(handle(1), time.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .unwrap();
+    }
+    let compressed = encode_block(&block, EncodeOptions::default());
+    let raw = encode_block(
+        &block,
+        EncodeOptions {
+            wave_compression: WaveCompression::None,
+            ..EncodeOptions::default()
+        },
+    );
+    assert!(compressed.len() < raw.len());
+
+    let a = decode_block(&compressed, &geometry);
+    let b = decode_block(&raw, &geometry);
+    assert_eq!(a.changes, b.changes);
+    assert_eq!(a.memory_required, b.memory_required);
+    assert_eq!(a.head.pack_type, b'4');
+}
+
+#[test]
+fn time_table_and_frame_are_compressed_only_when_strictly_smaller() {
+    let geometry = [VariableLength::Bits(1)];
+    let mut small = BlockBuffer::new(&geometry).unwrap();
+    small.push_time(1).unwrap();
+    let decoded = decode_block(&encode_block(&small, EncodeOptions::default()), &geometry);
+    assert_eq!(
+        decoded.tail.time_uncompressed_length,
+        decoded.tail.time_compressed_length
+    );
+    assert_eq!(
+        decoded.head.bits_uncompressed_length,
+        decoded.head.bits_compressed_length
+    );
+
+    let geometry = [VariableLength::Bits(4096)];
+    let mut large = BlockBuffer::new(&geometry).unwrap();
+    for time in 0..1000 {
+        large.push_time(time * 5).unwrap();
+    }
+    let decoded = decode_block(&encode_block(&large, EncodeOptions::default()), &geometry);
+    assert!(decoded.tail.time_compressed_length < decoded.tail.time_uncompressed_length);
+    assert!(decoded.head.bits_compressed_length < decoded.head.bits_uncompressed_length);
+    assert_eq!(decoded.times.len(), 1000);
+    assert_eq!(decoded.frame[0], vec![b'x'; 4096]);
+}
+
+#[test]
+fn block_buffer_rejects_invalid_changes() {
+    let geometry = [
+        VariableLength::Bits(1),
+        VariableLength::Bits(8),
+        VariableLength::Real,
+        VariableLength::VarLen,
+        VariableLength::Bits(65),
+    ];
+    let mut block = BlockBuffer::new(&geometry).unwrap();
+    block.push_time(10).unwrap();
+    let invalid = |result: std::io::Result<()>| {
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    };
+    invalid(block.change_bit(handle(5), true));
+    invalid(block.change_ascii(handle(0), b"q"));
+    invalid(block.change_ascii(handle(1), b"0101"));
+    invalid(block.change_bit(handle(1), true));
+    invalid(block.change_f64(handle(1), 1.0));
+    invalid(block.change_u64(handle(4), 1));
+    invalid(block.change_words32(handle(4), &[0, 0]));
+    invalid(block.change_four_state(handle(1), &[0], &[]));
+    invalid(block.change_ascii(handle(3), b"text"));
+    invalid(block.change_var_len(handle(2), b"12345678"));
+    invalid(block.change(
+        handle(1),
+        Value::Packed {
+            data: &[0],
+            bits: 7,
+        },
+    ));
+    invalid(block.push_time(9));
+
+    block.push_time(11).unwrap();
+    block.change_bit(handle(0), true).unwrap();
+    invalid(block.change_at(0, handle(0), Value::Bit(b'0')));
+    invalid(block.change_at(2, handle(0), Value::Bit(b'0')));
+    block
+        .change_at(0, handle(1), Value::Ascii(b"00000000"))
+        .unwrap();
+
+    let mut next = BlockBuffer::new(&geometry).unwrap();
+    block.start_next(&mut next).unwrap();
+    invalid(next.change_bit(handle(0), false));
+
+    invalid(BlockBuffer::new(&[VariableLength::Bits(0)]).map(drop));
+    let empty = BlockBuffer::new(&geometry).unwrap();
+    let mut out = Vec::new();
+    invalid(BlockEncoder::new(EncodeOptions::default()).encode(&empty, &mut out));
+    invalid(empty.start_next(&mut next));
+}
+
+/// A randomly generated change, with its expected ASCII value.
+fn random_change(
+    rng: &mut rand::rngs::StdRng,
+    length: VariableLength,
+    block: &mut BlockBuffer,
+    signal: usize,
+) -> Vec<u8> {
+    use rand::RngExt;
+    let h = handle(signal);
+    match length {
+        VariableLength::Real => {
+            let value: f64 = rng.random_range(-1e3..1e3);
+            block.change_f64(h, value).unwrap();
+            value.to_le_bytes().to_vec()
+        }
+        VariableLength::VarLen => {
+            let len = rng.random_range(0..12);
+            let bytes: Vec<u8> = (0..len).map(|_| rng.random_range(b'a'..=b'c')).collect();
+            block.change_var_len(h, &bytes).unwrap();
+            bytes
+        }
+        VariableLength::Bits(bits) => {
+            let bits = bits as usize;
+            let four_state = rng.random_bool(0.3);
+            let ascii: Vec<u8> = (0..bits)
+                .map(|_| {
+                    if four_state {
+                        b"01xz"[rng.random_range(0..4)]
+                    } else {
+                        b"01"[rng.random_range(0..2)]
+                    }
+                })
+                .collect();
+            let words = |word_bits: usize| -> (Vec<u64>, Vec<u64>) {
+                let count = bits.div_ceil(word_bits);
+                let mut aval = vec![0u64; count];
+                let mut bval = vec![0u64; count];
+                for (i, &c) in ascii.iter().rev().enumerate() {
+                    let (a, b) = match c {
+                        b'0' => (0, 0),
+                        b'1' => (1, 0),
+                        b'z' => (0, 1),
+                        _ => (1, 1),
+                    };
+                    aval[i / word_bits] |= a << (i % word_bits);
+                    bval[i / word_bits] |= b << (i % word_bits);
+                }
+                (aval, bval)
+            };
+            match rng.random_range(0..6) {
+                0 => block.change_ascii(h, &ascii).unwrap(),
+                1 if four_state => {
+                    let (aval, bval) = words(32);
+                    let aval: Vec<u32> = aval.iter().map(|&w| w as u32).collect();
+                    let bval: Vec<u32> = bval.iter().map(|&w| w as u32).collect();
+                    block.change_four_state(h, &aval, &bval).unwrap();
+                }
+                _ if four_state => block.change(h, Value::Ascii(&ascii)).unwrap(),
+                2 if bits <= 64 => block.change_u64(h, words(64).0[0]).unwrap(),
+                3 => {
+                    let words: Vec<u32> = words(32).0.iter().map(|&w| w as u32).collect();
+                    block.change_words32(h, &words).unwrap();
+                }
+                4 => block.change_words64(h, &words(64).0).unwrap(),
+                _ => {
+                    let mut packed = vec![0u8; bits.div_ceil(8)];
+                    for (i, &c) in ascii.iter().enumerate() {
+                        packed[i / 8] |= (c & 1) << (7 - i % 8);
+                    }
+                    block
+                        .change(
+                            h,
+                            Value::Packed {
+                                data: &packed,
+                                bits,
+                            },
+                        )
+                        .unwrap();
+                }
+            }
+            ascii
+        }
+    }
+}
+
+#[test]
+fn random_blocks_round_trip_through_the_block_readers() {
+    use rand::{RngExt, SeedableRng};
+    for seed in 0..40 {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let geometry: Vec<VariableLength> = (0..rng.random_range(1..30))
+            .map(|_| match rng.random_range(0..10) {
+                0 => VariableLength::Real,
+                1 => VariableLength::VarLen,
+                2..=5 => VariableLength::Bits(1),
+                _ => VariableLength::Bits(rng.random_range(2..140)),
+            })
+            .collect();
+
+        let mut block = BlockBuffer::new(&geometry).unwrap();
+        let mut expected: Vec<Vec<(u64, Vec<u8>)>> = vec![Vec::new(); geometry.len()];
+        let mut time = rng.random_range(0..100);
+        for time_index in 0..rng.random_range(1..60u64) {
+            block.push_time(time).unwrap();
+            time += rng.random_range(1..1000);
+            for _ in 0..rng.random_range(0..geometry.len() * 2) {
+                let signal = rng.random_range(0..geometry.len());
+                let ascii = random_change(&mut rng, geometry[signal], &mut block, signal);
+                let changes = &mut expected[signal];
+                if changes
+                    .last()
+                    .is_some_and(|(index, _)| *index == time_index)
+                {
+                    changes.pop();
+                }
+                changes.push((time_index, ascii));
+            }
+        }
+
+        let decoded = decode_block(&encode_block(&block, EncodeOptions::default()), &geometry);
+        assert_eq!(decoded.times, block.times(), "seed {seed}");
+        assert_eq!(decoded.changes, expected, "seed {seed}");
+    }
+}
