@@ -3262,8 +3262,23 @@ impl BlockEncoder {
             {
                 continue;
             }
-            let packed = wave_value(change, &block.payload, length, &mut self.value);
             let at_first_step = block.first && change.time_index == 0;
+            // Deduplication compares the packed bytes kept in `previous`, so
+            // only the plain path skips them.
+            if !dedup && change.form() == ChangeForm::Word {
+                let VariableLength::Bits(bits) = length else {
+                    unreachable!("words are recorded for bit vectors")
+                };
+                let left_aligned = u64::from(change.data) << (64 - bits);
+                let time_index = u64::from(change.time_index);
+                write_varint(&mut self.waves, (time_index - previous_index) << 1);
+                previous_index = time_index;
+                let len = (bits as usize).div_ceil(8);
+                self.waves
+                    .extend_from_slice(&left_aligned.to_be_bytes()[..len]);
+                continue;
+            }
+            let packed = wave_value(change, &block.payload, length, &mut self.value);
             if dedup && !at_first_step && self.value == self.previous {
                 continue;
             }
