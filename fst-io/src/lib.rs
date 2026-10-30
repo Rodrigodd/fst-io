@@ -2407,8 +2407,6 @@ pub struct BlockBuffer {
     changes: Vec<BufferedChange>,
     payload: Vec<u8>,
     slots: Vec<Slot>,
-    /// The signals with a change in this block, in first-change order.
-    changed: Vec<u32>,
 }
 
 impl BlockBuffer {
@@ -2430,7 +2428,6 @@ impl BlockBuffer {
             times: Vec::new(),
             changes: Vec::new(),
             payload: Vec::new(),
-            changed: Vec::new(),
         })
     }
 
@@ -2496,8 +2493,7 @@ impl BlockBuffer {
 
         let n = self.layout.geometry.len();
         if Arc::ptr_eq(&next.layout, &self.layout) && next.slots.len() == n {
-            for &handle in &next.changed {
-                let slot = &mut next.slots[handle as usize];
+            for slot in &mut next.slots {
                 slot.last_change = NO_CHANGE;
                 slot.changes = 0;
             }
@@ -2507,7 +2503,6 @@ impl BlockBuffer {
             next.slots
                 .extend(self.layout.geometry.iter().map(|&length| Slot::new(length)));
         }
-        next.changed.clear();
         next.changes.clear();
         next.payload.clear();
         next.times.clear();
@@ -2517,10 +2512,12 @@ impl BlockBuffer {
         next.frame.clear();
         next.frame.extend_from_slice(&self.frame);
         let mut value = Vec::new();
-        for &handle in &self.changed {
-            let handle = handle as usize;
+        for (handle, slot) in self.slots.iter().enumerate() {
+            if slot.changes == 0 {
+                continue;
+            }
             let length = self.layout.geometry[handle];
-            let change = self.changes[self.slots[handle].last_change as usize];
+            let change = self.changes[slot.last_change as usize];
             let offset = self.layout.frame_offsets[handle];
             let packed = wave_value(change, &self.payload, length, &mut value);
             match length {
@@ -2591,9 +2588,6 @@ impl BlockBuffer {
             data,
         ));
         let slot = &mut self.slots[handle.index()];
-        if slot.last_change == NO_CHANGE {
-            self.changed.push(handle.index() as u32);
-        }
         slot.last_change = index;
         slot.changes += 1;
     }
