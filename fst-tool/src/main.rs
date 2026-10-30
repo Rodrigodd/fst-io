@@ -274,28 +274,19 @@ fn push_column(line: &mut String, text: &str, width: usize) {
 fn info(input: &Path, header: bool, hier: bool, flat: bool, names: bool) -> std::io::Result<()> {
     let hier_sibling = hier_sibling_path(input);
     let input = FstInput::open_path(input)?;
+    let reader = FstReader::open_with_hierarchy(input, hier_sibling.clone())?;
     if header {
-        info_header(&input)?;
+        info_header(reader.header())?;
     }
     if hier {
-        info_hierarchy(&input, hier_sibling.as_deref(), flat, names)?;
+        info_hierarchy(reader.input(), hier_sibling.as_deref(), flat, names)?;
     }
     Ok(())
 }
 
 /// Prints the header as `key: value` lines: timescale (as a VCD unit label),
 /// time range, writer, date, and the scope/variable/block counts.
-fn info_header(input: &FstInput) -> std::io::Result<()> {
-    let mut iterator = SectionIterator::new(input.open()?);
-    let mut header = None;
-    while let Some(section) = iterator.next()? {
-        if matches!(section.block_type(), Some(BlockType::Header)) {
-            header = Some(section.read_header()?);
-            break;
-        }
-    }
-    let header = header.ok_or_else(|| invalid_data("file has no header block"))?;
-
+fn info_header(header: &HeaderBlock) -> std::io::Result<()> {
     let mut out = BufWriter::new(std::io::stdout().lock());
     // asctime() leaves a trailing newline inside the date field; trim it so the
     // date stays on its own `key: value` line.

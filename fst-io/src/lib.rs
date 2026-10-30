@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Take, Write};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -736,6 +737,188 @@ where
         }
     }
     Ok(lengths)
+}
+
+/// A dense, 1-based signal handle, the identity of a variable across the
+/// high-level reader API.
+///
+/// Wraps a [`NonZeroU32`] so an id and a 0-based geometry index cannot be
+/// confused. [`index`](Self::index) converts to the 0-based geometry index the
+/// block-level readers and geometry table use; [`from_index`](Self::from_index)
+/// is the inverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FstSignalHandle(NonZeroU32);
+
+impl FstSignalHandle {
+    /// Builds a handle from a 0-based geometry index.
+    pub fn from_index(index: usize) -> FstSignalHandle {
+        FstSignalHandle(NonZeroU32::new(index as u32 + 1).expect("index + 1 is non-zero"))
+    }
+
+    /// The 0-based geometry index this handle refers to.
+    pub fn index(&self) -> usize {
+        (self.0.get() - 1) as usize
+    }
+}
+
+impl std::fmt::Display for FstSignalHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "H{}", self.0.get())
+    }
+}
+
+/// A high-level reader that ties a whole FST file together: its header,
+/// geometry, hierarchy, and value changes.
+///
+/// It owns an [`FstInput`] (which reopens a fresh seekable reader per pass and
+/// decompresses a whole-file gzip wrapper once) and the optional sibling
+/// hierarchy path a simulator writes for an in-progress dump. The header and
+/// geometry are read on [`open`](Self::open); the hierarchy and value changes
+/// are streamed on demand. The reader reopens the input internally, so callers
+/// no longer manage the file's multiple passes themselves.
+///
+/// This sits on top of [`SectionIterator`] and the block readers; it adds no new
+/// parsing. The parallel/clocked consumers that need every cycle of performance
+/// keep driving the block readers directly.
+pub struct FstReader {
+    input: FstInput,
+    hier_sibling: Option<PathBuf>,
+    header: HeaderBlock,
+    geometry: Vec<VariableLength>,
+}
+
+impl FstReader {
+    /// Opens `input`, reading the header and geometry.
+    pub fn open(input: FstInput) -> std::io::Result<FstReader> {
+        Self::open_with_hierarchy(input, None)
+    }
+
+    /// Opens `input`, preferring `hier_sibling` (a `<file>.fst.hier` file a
+    /// simulator writes for an in-progress dump) over any embedded hierarchy
+    /// block when reading the hierarchy.
+    ///
+    /// The sibling is also what reconstructs the geometry when the dump was
+    /// interrupted before its geometry block was written.
+    pub fn open_with_hierarchy(
+        input: FstInput,
+        hier_sibling: Option<PathBuf>,
+    ) -> std::io::Result<FstReader> {
+        let mut header = None;
+        let mut geometry = None;
+        let mut iterator = SectionIterator::new(input.open()?);
+        while let Some(section) = iterator.next()? {
+            match section.block_type() {
+                Some(BlockType::Header) => header = Some(section.read_header()?),
+                Some(BlockType::Geometry) => {
+                    geometry = Some(
+                        section
+                            .read_geometry()?
+                            .lengths()
+                            .collect::<std::io::Result<Vec<_>>>()?,
+                    );
+                }
+                _ => {}
+            }
+        }
+        let header = header.ok_or_else(|| invalid_data("file has no header block"))?;
+
+        let mut reader = FstReader {
+            input,
+            hier_sibling,
+            header,
+            geometry: Vec::new(),
+        };
+
+        // An interrupted dump has no geometry section; reconstruct the lengths
+        // from the hierarchy records, which carry the same information.
+        reader.geometry = match geometry {
+            Some(geometry) => geometry,
+            None => {
+                let mut entries = Vec::new();
+                reader.read_hierarchy(|entry, _| {
+                    entries.push(entry.clone());
+                    Ok(())
+                })?;
+                geometry_from_entries(entries.into_iter().map(Ok))?
+            }
+        };
+
+        Ok(reader)
+    }
+
+    /// The file header block.
+    pub fn header(&self) -> &HeaderBlock {
+        &self.header
+    }
+
+    /// The input this reader draws from, for callers still driving the
+    /// block-level readers directly.
+    pub fn input(&self) -> &FstInput {
+        &self.input
+    }
+
+    /// The per-variable geometry lengths, indexed by 0-based geometry index
+    /// (equivalently, by [`FstSignalHandle::index`]). Reconstructed from the
+    /// hierarchy when the file has no geometry block.
+    pub fn geometry(&self) -> &[VariableLength] {
+        &self.geometry
+    }
+
+    /// Calls `callback` for each hierarchy entry, with the names of the
+    /// enclosing scopes (innermost last) so a caller need not maintain its own
+    /// scope stack to build a variable's dotted path.
+    ///
+    /// A sibling `<file>.fst.hier` file, when given at open time, is read in
+    /// preference to any embedded hierarchy block, matching the reference
+    /// library's handling of an in-progress dump.
+    pub fn read_hierarchy(
+        &self,
+        mut callback: impl FnMut(&HierarchyEntry, &[Vec<u8>]) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let mut scopes: Vec<Vec<u8>> = Vec::new();
+
+        if let Some(path) = &self.hier_sibling {
+            let reader = BufReader::new(File::open(path)?);
+            for entry in HierarchyEntries::from_records(reader) {
+                visit_hierarchy_entry(&entry?, &mut scopes, &mut callback)?;
+            }
+            return Ok(());
+        }
+
+        let mut iterator = SectionIterator::new(self.input.open()?);
+        while let Some(section) = iterator.next()? {
+            if !matches!(
+                section.block_type(),
+                Some(BlockType::Hierarchy | BlockType::HierarchyLZ4 | BlockType::HierarchyLZ4Duo)
+            ) {
+                continue;
+            }
+            for entry in section.read_hierarchy()?.entries()? {
+                visit_hierarchy_entry(&entry?, &mut scopes, &mut callback)?;
+            }
+            return Ok(());
+        }
+        Err(invalid_data("file has no hierarchy block"))
+    }
+}
+
+/// Dispatches one hierarchy entry to `callback` with the current scope stack,
+/// then updates the stack: a `Scope` is reported before it is pushed, an
+/// `UpScope` before the enclosing scope is popped.
+fn visit_hierarchy_entry(
+    entry: &HierarchyEntry,
+    scopes: &mut Vec<Vec<u8>>,
+    callback: &mut impl FnMut(&HierarchyEntry, &[Vec<u8>]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    callback(entry, scopes)?;
+    match entry {
+        HierarchyEntry::Scope { name, .. } => scopes.push(name.clone()),
+        HierarchyEntry::UpScope => {
+            scopes.pop();
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Name of a variable type (FST_VT_*), or `None` if unknown.
