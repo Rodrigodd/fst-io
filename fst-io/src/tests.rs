@@ -1538,26 +1538,67 @@ fn block_buffer_rejects_invalid_changes() {
     invalid(empty.start_next(&mut next));
 }
 
-/// A randomly generated change, with its expected ASCII value.
-fn random_change(
-    rng: &mut rand::rngs::StdRng,
-    length: VariableLength,
-    block: &mut BlockBuffer,
-    signal: usize,
-) -> Vec<u8> {
+/// A change in one of the input forms the writer accepts.
+enum Input {
+    Ascii(Vec<u8>),
+    Value(Vec<u8>),
+    U64(u64),
+    Words32(Vec<u32>),
+    Words64(Vec<u64>),
+    FourState(Vec<u32>, Vec<u32>),
+    Packed(Vec<u8>, usize),
+    F64(f64),
+    VarLen(Vec<u8>),
+}
+
+/// Records an [`Input`] through the matching `change_*` method.
+trait Record {
+    fn record(&mut self, handle: FstSignalHandle, input: &Input) -> std::io::Result<()>;
+}
+
+macro_rules! record_input {
+    ($target:expr, $handle:expr, $input:expr) => {
+        match $input {
+            Input::Ascii(ascii) => $target.change_ascii($handle, ascii),
+            Input::Value(ascii) => $target.change($handle, Value::Ascii(ascii)),
+            Input::U64(value) => $target.change_u64($handle, *value),
+            Input::Words32(words) => $target.change_words32($handle, words),
+            Input::Words64(words) => $target.change_words64($handle, words),
+            Input::FourState(aval, bval) => $target.change_four_state($handle, aval, bval),
+            Input::Packed(data, bits) => {
+                $target.change($handle, Value::Packed { data, bits: *bits })
+            }
+            Input::F64(value) => $target.change_f64($handle, *value),
+            Input::VarLen(bytes) => $target.change_var_len($handle, bytes),
+        }
+    };
+}
+
+impl Record for BlockBuffer {
+    fn record(&mut self, handle: FstSignalHandle, input: &Input) -> std::io::Result<()> {
+        record_input!(self, handle, input)
+    }
+}
+
+impl<W: std::io::Write + std::io::Seek> Record for FstValueWriter<W> {
+    fn record(&mut self, handle: FstSignalHandle, input: &Input) -> std::io::Result<()> {
+        record_input!(self, handle, input)
+    }
+}
+
+/// A random change of a signal of the given length, with its expected value
+/// as ASCII (raw bytes for a real).
+fn random_input(rng: &mut rand::rngs::StdRng, length: VariableLength) -> (Input, Vec<u8>) {
     use rand::RngExt;
-    let h = handle(signal);
     match length {
         VariableLength::Real => {
             let value: f64 = rng.random_range(-1e3..1e3);
-            block.change_f64(h, value).unwrap();
-            value.to_le_bytes().to_vec()
+            (Input::F64(value), value.to_le_bytes().to_vec())
         }
         VariableLength::VarLen => {
             let len = rng.random_range(0..12);
             let bytes: Vec<u8> = (0..len).map(|_| rng.random_range(b'a'..=b'c')).collect();
-            block.change_var_len(h, &bytes).unwrap();
-            bytes
+            (Input::VarLen(bytes.clone()), bytes)
         }
         VariableLength::Bits(bits) => {
             let bits = bits as usize;
@@ -1587,40 +1628,41 @@ fn random_change(
                 }
                 (aval, bval)
             };
-            match rng.random_range(0..6) {
-                0 => block.change_ascii(h, &ascii).unwrap(),
+            let narrow =
+                |words: Vec<u64>| -> Vec<u32> { words.iter().map(|&w| w as u32).collect() };
+            let input = match rng.random_range(0..6) {
+                0 => Input::Ascii(ascii.clone()),
                 1 if four_state => {
                     let (aval, bval) = words(32);
-                    let aval: Vec<u32> = aval.iter().map(|&w| w as u32).collect();
-                    let bval: Vec<u32> = bval.iter().map(|&w| w as u32).collect();
-                    block.change_four_state(h, &aval, &bval).unwrap();
+                    Input::FourState(narrow(aval), narrow(bval))
                 }
-                _ if four_state => block.change(h, Value::Ascii(&ascii)).unwrap(),
-                2 if bits <= 64 => block.change_u64(h, words(64).0[0]).unwrap(),
-                3 => {
-                    let words: Vec<u32> = words(32).0.iter().map(|&w| w as u32).collect();
-                    block.change_words32(h, &words).unwrap();
-                }
-                4 => block.change_words64(h, &words(64).0).unwrap(),
+                _ if four_state => Input::Value(ascii.clone()),
+                2 if bits <= 64 => Input::U64(words(64).0[0]),
+                3 => Input::Words32(narrow(words(32).0)),
+                4 => Input::Words64(words(64).0),
                 _ => {
                     let mut packed = vec![0u8; bits.div_ceil(8)];
                     for (i, &c) in ascii.iter().enumerate() {
                         packed[i / 8] |= (c & 1) << (7 - i % 8);
                     }
-                    block
-                        .change(
-                            h,
-                            Value::Packed {
-                                data: &packed,
-                                bits,
-                            },
-                        )
-                        .unwrap();
+                    Input::Packed(packed, bits)
                 }
-            }
-            ascii
+            };
+            (input, ascii)
         }
     }
+}
+
+fn random_geometry(rng: &mut rand::rngs::StdRng, max_signals: usize) -> Vec<VariableLength> {
+    use rand::RngExt;
+    (0..rng.random_range(1..max_signals))
+        .map(|_| match rng.random_range(0..10) {
+            0 => VariableLength::Real,
+            1 => VariableLength::VarLen,
+            2..=5 => VariableLength::Bits(1),
+            _ => VariableLength::Bits(rng.random_range(2..140)),
+        })
+        .collect()
 }
 
 #[test]
@@ -1628,14 +1670,7 @@ fn random_blocks_round_trip_through_the_block_readers() {
     use rand::{RngExt, SeedableRng};
     for seed in 0..40 {
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        let geometry: Vec<VariableLength> = (0..rng.random_range(1..30))
-            .map(|_| match rng.random_range(0..10) {
-                0 => VariableLength::Real,
-                1 => VariableLength::VarLen,
-                2..=5 => VariableLength::Bits(1),
-                _ => VariableLength::Bits(rng.random_range(2..140)),
-            })
-            .collect();
+        let geometry = random_geometry(&mut rng, 30);
 
         let mut block = BlockBuffer::new(&geometry).unwrap();
         let mut expected: Vec<Vec<(u64, Vec<u8>)>> = vec![Vec::new(); geometry.len()];
@@ -1645,7 +1680,8 @@ fn random_blocks_round_trip_through_the_block_readers() {
             time += rng.random_range(1..1000);
             for _ in 0..rng.random_range(0..geometry.len() * 2) {
                 let signal = rng.random_range(0..geometry.len());
-                let ascii = random_change(&mut rng, geometry[signal], &mut block, signal);
+                let (input, ascii) = random_input(&mut rng, geometry[signal]);
+                block.record(handle(signal), &input).unwrap();
                 let changes = &mut expected[signal];
                 if changes
                     .last()
@@ -1661,4 +1697,541 @@ fn random_blocks_round_trip_through_the_block_readers() {
         assert_eq!(decoded.times, block.times(), "seed {seed}");
         assert_eq!(decoded.changes, expected, "seed {seed}");
     }
+}
+
+fn reader_of(bytes: Vec<u8>) -> FstReader {
+    FstReader::open(FstInput::Memory(Arc::from(bytes.into_boxed_slice()))).unwrap()
+}
+
+/// Every value change of a file, per signal, as (time, ASCII).
+fn changes_of(reader: &FstReader) -> Vec<Vec<(u64, Vec<u8>)>> {
+    let mut changes = vec![Vec::new(); reader.geometry().len()];
+    reader
+        .read_value_changes(
+            TimeFilter {
+                start: 0,
+                end: u64::MAX,
+            },
+            None,
+            |time, handle, value| {
+                changes[handle.index()].push((time, value.to_ascii()));
+                Ok::<(), std::convert::Infallible>(())
+            },
+        )
+        .unwrap();
+    changes
+}
+
+/// Each section of a file, as (block type, whole section bytes).
+fn sections_of(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    let mut iterator = SectionIterator::new(std::io::Cursor::new(bytes));
+    let mut sections = Vec::new();
+    while let Some(mut section) = iterator.next().unwrap() {
+        let mut data = Vec::new();
+        section.copy_to(&mut data).unwrap();
+        sections.push((section.block_type, data));
+    }
+    sections
+}
+
+fn value_change_blocks(bytes: &[u8], geometry: &[VariableLength]) -> Vec<DecodedBlock> {
+    sections_of(bytes)
+        .into_iter()
+        .filter(|(block_type, _)| *block_type == BlockType::ValueChangeDataDynamicAlias2 as u8)
+        .map(|(_, data)| decode_block(&data, geometry))
+        .collect()
+}
+
+fn memory_writer(options: FstWriterOptions) -> FstHierarchyWriter<std::io::Cursor<Vec<u8>>> {
+    FstHierarchyWriter::new(std::io::Cursor::new(Vec::new()), options).unwrap()
+}
+
+/// A randomly generated file and what reading it back must give.
+struct RandomFile {
+    bytes: Vec<u8>,
+    geometry: Vec<VariableLength>,
+    num_hierarchy_vars: u64,
+    first_time: u64,
+    last_time: u64,
+    /// Each signal's changes, as (time, ASCII), before deduplication.
+    changes: Vec<Vec<(u64, Vec<u8>)>>,
+}
+
+fn write_random_file(seed: u64, options: FstWriterOptions) -> RandomFile {
+    use rand::{RngExt, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let geometry = random_geometry(&mut rng, 40);
+
+    let mut writer = memory_writer(options);
+    writer.scope(ScopeType::Module, b"top", b"top_c").unwrap();
+    let mut num_hierarchy_vars = 0;
+    for (index, &length) in geometry.iter().enumerate() {
+        let name = format!("s{index}");
+        let handle = match length {
+            VariableLength::Real => {
+                writer.var(VarType::Real, VarDirection::Implicit, name.as_bytes(), 64)
+            }
+            VariableLength::VarLen => {
+                writer.var(VarType::String, VarDirection::Input, name.as_bytes(), 0)
+            }
+            VariableLength::Bits(bits) => writer.var(
+                VarType::Logic,
+                VarDirection::Output,
+                name.as_bytes(),
+                bits as u32,
+            ),
+        }
+        .unwrap();
+        assert_eq!(handle.index(), index);
+        num_hierarchy_vars += 1;
+        if rng.random_bool(0.2) {
+            if index % 3 == 0 {
+                writer.scope(ScopeType::Generate, b"g", b"").unwrap();
+                writer.upscope().unwrap();
+            }
+            let of = FstSignalHandle::from_index(rng.random_range(0..=index));
+            let alias = writer
+                .alias(VarType::Wire, VarDirection::Implicit, b"alias", 1, of)
+                .unwrap();
+            assert_eq!(alias, of);
+            num_hierarchy_vars += 1;
+        }
+    }
+    writer.upscope().unwrap();
+    let mut values = writer.into_values().unwrap();
+
+    let mut changes: Vec<Vec<(u64, Vec<u8>)>> = vec![Vec::new(); geometry.len()];
+    let first_time = rng.random_range(0..100);
+    let mut time = first_time;
+    let mut record = |values: &mut FstValueWriter<_>, rng: &mut rand::rngs::StdRng, time: u64| {
+        let signal = rng.random_range(0..geometry.len());
+        let (input, ascii) = random_input(rng, geometry[signal]);
+        values.record(handle(signal), &input).unwrap();
+        let changes = &mut changes[signal];
+        if changes.last().is_some_and(|(t, _)| *t == time) {
+            changes.pop();
+        }
+        changes.push((time, ascii));
+    };
+    for _ in 0..rng.random_range(0..10) {
+        record(&mut values, &mut rng, first_time);
+    }
+    let mut last_time = first_time;
+    for _ in 0..rng.random_range(1..80) {
+        values.time(time).unwrap();
+        last_time = time;
+        for _ in 0..rng.random_range(0..geometry.len() + 1) {
+            record(&mut values, &mut rng, time);
+            if rng.random_bool(0.05) {
+                values.time(time).unwrap();
+            }
+        }
+        if rng.random_bool(0.1) {
+            values.flush().unwrap();
+        }
+        time += rng.random_range(1..50);
+    }
+    let bytes = values.finish().unwrap().into_inner();
+    RandomFile {
+        bytes,
+        geometry,
+        num_hierarchy_vars,
+        first_time,
+        last_time,
+        changes,
+    }
+}
+
+/// The value each signal has before any change: `x` bits and NaN reals.
+fn initial_value(length: VariableLength) -> Vec<u8> {
+    match length {
+        VariableLength::Bits(bits) => vec![b'x'; bits as usize],
+        VariableLength::Real => f64::NAN.to_le_bytes().to_vec(),
+        VariableLength::VarLen => Vec::new(),
+    }
+}
+
+fn check_random_file(file: &RandomFile, deduplicate: bool, seed: u64) {
+    let reader = reader_of(file.bytes.clone());
+    let header = reader.header();
+    assert_eq!(reader.geometry(), file.geometry, "seed {seed}");
+    assert_eq!(header.start_time, file.first_time, "seed {seed}");
+    assert_eq!(header.end_time, file.last_time, "seed {seed}");
+    assert_eq!(header.num_vars, file.geometry.len() as u64);
+    assert_eq!(header.num_hierarchy_vars, file.num_hierarchy_vars);
+
+    let mut expected = file.changes.clone();
+    if deduplicate {
+        for (signal, changes) in expected.iter_mut().enumerate() {
+            let length = file.geometry[signal];
+            let mut previous = initial_value(length);
+            changes.retain(|(time, value)| {
+                let keep = *time == file.first_time
+                    || length == VariableLength::VarLen
+                    || *value != previous;
+                previous = value.clone();
+                keep
+            });
+        }
+    }
+    assert_eq!(changes_of(&reader), expected, "seed {seed}");
+
+    let blocks = value_change_blocks(&file.bytes, &file.geometry);
+    assert_eq!(header.num_vc_blocks, blocks.len() as u64);
+    for (k, block) in blocks.iter().enumerate() {
+        if k > 0 {
+            assert_eq!(block.start_time, blocks[k - 1].end_time, "seed {seed}");
+        }
+        assert_eq!(block.times.first(), Some(&block.start_time));
+        for (signal, &length) in file.geometry.iter().enumerate() {
+            if length == VariableLength::VarLen {
+                continue;
+            }
+            let state = file.changes[signal]
+                .iter()
+                .rev()
+                .find(|(time, _)| k > 0 && *time <= block.start_time)
+                .map_or_else(|| initial_value(length), |(_, value)| value.clone());
+            assert_eq!(
+                block.frame[signal], state,
+                "seed {seed} block {k} signal {signal}"
+            );
+        }
+    }
+}
+
+#[test]
+fn random_files_are_read_back_by_fst_reader() {
+    let mut most_blocks = 0;
+    for seed in 0..40 {
+        let options = FstWriterOptions {
+            block_size: 300,
+            ..FstWriterOptions::default()
+        };
+        let file = write_random_file(seed, options);
+        check_random_file(&file, false, seed);
+        most_blocks = most_blocks.max(value_change_blocks(&file.bytes, &file.geometry).len());
+    }
+    assert!(most_blocks >= 5, "{most_blocks}");
+}
+
+#[test]
+fn random_deduplicated_files_are_read_back_by_fst_reader() {
+    for seed in 0..40 {
+        let options = FstWriterOptions {
+            block_size: 300,
+            encode: EncodeOptions {
+                deduplicate: true,
+                ..EncodeOptions::default()
+            },
+            ..FstWriterOptions::default()
+        };
+        check_random_file(&write_random_file(seed, options), true, seed);
+    }
+}
+
+#[test]
+fn header_records_the_options_and_counts() {
+    let options = FstWriterOptions {
+        timescale: -12,
+        timezero: -5,
+        file_type: FileType::VerilogVhdl,
+        writer: b"sim 1.0".to_vec(),
+        date: b"Fri Oct 30 15:00:00 2026".to_vec(),
+        ..FstWriterOptions::default()
+    };
+    let mut writer = memory_writer(options);
+    writer.scope(ScopeType::Module, b"top", b"").unwrap();
+    writer.scope(ScopeType::Task, b"t", b"").unwrap();
+    let a = writer
+        .var(VarType::Wire, VarDirection::Input, b"a", 1)
+        .unwrap();
+    writer.upscope().unwrap();
+    writer
+        .alias(VarType::Wire, VarDirection::Input, b"b", 1, a)
+        .unwrap();
+    let mut values = writer.into_values().unwrap();
+    values.time(7).unwrap();
+    values.change_bit(a, true).unwrap();
+    values.time(9).unwrap();
+    let bytes = values.finish().unwrap().into_inner();
+
+    let header = *reader_of(bytes).header();
+    assert_eq!((header.start_time, header.end_time), (7, 9));
+    assert_eq!(header.timescale, -12);
+    assert_eq!(header.timezero, -5);
+    assert_eq!(header.file_type, FileType::VerilogVhdl as u8);
+    assert_eq!(&header.writer[..8], b"sim 1.0\0");
+    assert_eq!(&header.date[..25], b"Fri Oct 30 15:00:00 2026\0");
+    assert!(matches!(
+        header.real_endianness,
+        RealEndianess::LittleEndian
+    ));
+    assert_eq!(header.num_scopes, 2);
+    assert_eq!(header.num_hierarchy_vars, 2);
+    assert_eq!(header.num_vars, 1);
+    assert_eq!(header.num_vc_blocks, 1);
+}
+
+#[test]
+fn hierarchy_entries_are_written_as_given() {
+    let (_, entries) = sample_hierarchy();
+    let mut writer = memory_writer(FstWriterOptions::default());
+    for entry in &entries {
+        writer.entry(entry).unwrap();
+    }
+    let bytes = writer.into_values().unwrap().finish().unwrap().into_inner();
+
+    let mut read = Vec::new();
+    reader_of(bytes)
+        .read_hierarchy(|entry, _| {
+            read.push(entry.clone());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(read, entries);
+}
+
+#[test]
+fn declarations_record_libfst_lengths() {
+    let mut writer = memory_writer(FstWriterOptions::default());
+    writer
+        .var(VarType::Real, VarDirection::Implicit, b"r", 64)
+        .unwrap();
+    writer
+        .var(VarType::ShortReal, VarDirection::Implicit, b"sr", 32)
+        .unwrap();
+    writer
+        .var(VarType::String, VarDirection::Implicit, b"s", 99)
+        .unwrap();
+    writer
+        .var(VarType::Wire, VarDirection::Implicit, b"z", 0)
+        .unwrap();
+    writer
+        .var(VarType::Port, VarDirection::Input, b"p", 11)
+        .unwrap();
+    let bytes = writer.into_values().unwrap().finish().unwrap().into_inner();
+
+    let reader = reader_of(bytes);
+    assert_eq!(
+        reader.geometry(),
+        [
+            VariableLength::Real,
+            VariableLength::Real,
+            VariableLength::VarLen,
+            VariableLength::VarLen,
+            VariableLength::Bits(11),
+        ]
+    );
+    let mut lengths = Vec::new();
+    reader
+        .read_hierarchy(|entry, _| {
+            if let HierarchyEntry::Var { length, .. } = entry {
+                lengths.push(*length);
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(lengths, [8, 8, 0, 0, 11]);
+}
+
+#[test]
+fn values_before_the_first_time_happen_at_the_first_time() {
+    let mut writer = memory_writer(FstWriterOptions::default());
+    let a = writer
+        .var(VarType::Wire, VarDirection::Implicit, b"a", 4)
+        .unwrap();
+    let mut values = writer.into_values().unwrap();
+    values.change_u64(a, 3).unwrap();
+    values.time(20).unwrap();
+    values.time(30).unwrap();
+    values.change_u64(a, 4).unwrap();
+    let reader = reader_of(values.finish().unwrap().into_inner());
+    assert_eq!(
+        changes_of(&reader)[0],
+        [(20, b"0011".to_vec()), (30, b"0100".to_vec())]
+    );
+    assert_eq!(reader.header().start_time, 20);
+}
+
+#[test]
+fn finish_without_a_time_writes_one_block_at_time_zero() {
+    let mut writer = memory_writer(FstWriterOptions::default());
+    let a = writer
+        .var(VarType::Wire, VarDirection::Implicit, b"a", 1)
+        .unwrap();
+    let mut values = writer.into_values().unwrap();
+    values.change_bit(a, true).unwrap();
+    let bytes = values.finish().unwrap().into_inner();
+
+    let blocks = value_change_blocks(&bytes, &[VariableLength::Bits(1)]);
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].times, [0]);
+    let reader = reader_of(bytes);
+    assert_eq!(changes_of(&reader)[0], [(0, b"1".to_vec())]);
+    assert_eq!(
+        (reader.header().start_time, reader.header().end_time),
+        (0, 0)
+    );
+}
+
+#[test]
+fn a_file_without_variables_is_readable() {
+    let bytes = memory_writer(FstWriterOptions::default())
+        .into_values()
+        .unwrap()
+        .finish()
+        .unwrap()
+        .into_inner();
+    let reader = reader_of(bytes);
+    assert_eq!(reader.geometry(), []);
+    assert_eq!(reader.header().num_vc_blocks, 1);
+}
+
+#[test]
+fn flush_seals_the_block_at_the_next_time_change() {
+    let geometry = [VariableLength::Bits(1)];
+    let mut writer = memory_writer(FstWriterOptions::default());
+    let a = writer
+        .var(VarType::Wire, VarDirection::Implicit, b"a", 1)
+        .unwrap();
+    let mut values = writer.into_values().unwrap();
+    values.time(0).unwrap();
+    values.change_bit(a, false).unwrap();
+    values.flush().unwrap();
+    values.flush().unwrap();
+    values.change_bit(a, true).unwrap();
+    values.time(5).unwrap();
+    values.change_bit(a, false).unwrap();
+    values.flush().unwrap();
+    let bytes = values.finish().unwrap().into_inner();
+
+    let blocks = value_change_blocks(&bytes, &geometry);
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0].times, [0]);
+    assert_eq!(blocks[0].changes[0], ascii_changes(&[(0, "1")]));
+    assert_eq!(blocks[1].times, [0, 5]);
+    assert_eq!(blocks[1].frame[0], b"1");
+    assert_eq!(blocks[1].changes[0], ascii_changes(&[(1, "0")]));
+}
+
+#[test]
+fn dump_active_writes_a_blackout_section() {
+    let mut writer = memory_writer(FstWriterOptions::default());
+    writer
+        .var(VarType::Wire, VarDirection::Implicit, b"a", 1)
+        .unwrap();
+    let mut values = writer.into_values().unwrap();
+    values.dump_active(false);
+    values.time(10).unwrap();
+    values.time(25).unwrap();
+    values.dump_active(true);
+    let bytes = values.finish().unwrap().into_inner();
+
+    let (_, blackout) = sections_of(&bytes)
+        .into_iter()
+        .find(|(block_type, _)| *block_type == BlockType::Blackout as u8)
+        .unwrap();
+    assert_eq!(blackout[9..], [2, 0, 10, 1, 15]);
+}
+
+#[test]
+fn time_must_not_go_backwards() {
+    let mut writer = memory_writer(FstWriterOptions::default());
+    writer
+        .var(VarType::Wire, VarDirection::Implicit, b"a", 1)
+        .unwrap();
+    let mut values = writer.into_values().unwrap();
+    values.time(10).unwrap();
+    values.time(10).unwrap();
+    let err = values.time(9).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    values.finish().unwrap();
+}
+
+#[test]
+fn hierarchy_writer_rejects_invalid_declarations() {
+    let invalid = |result: std::io::Result<()>| {
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    };
+    let mut writer = memory_writer(FstWriterOptions::default());
+    invalid(writer.upscope());
+    invalid(writer.scope(ScopeType::Module, b"a\0b", b""));
+    invalid(
+        writer
+            .var(VarType::Wire, VarDirection::Implicit, b"v\0", 1)
+            .map(drop),
+    );
+    invalid(
+        writer
+            .var(VarType::Wire, VarDirection::Implicit, b"v", u32::MAX)
+            .map(drop),
+    );
+    invalid(
+        writer
+            .alias(VarType::Wire, VarDirection::Implicit, b"v", 1, handle(0))
+            .map(drop),
+    );
+    let mut entry = crate::var_entry(VarType::Wire, VarDirection::Implicit, b"v", 1, None);
+    if let HierarchyEntry::Var { var_type, .. } = &mut entry {
+        *var_type = 30;
+    }
+    invalid(writer.entry(&entry).map(drop));
+
+    let long = FstWriterOptions {
+        writer: vec![b'w'; 128],
+        ..FstWriterOptions::default()
+    };
+    invalid(FstHierarchyWriter::new(std::io::Cursor::new(Vec::new()), long).map(drop));
+}
+
+#[test]
+fn dropping_the_writers_finishes_the_file() {
+    let path = std::env::temp_dir().join(format!("fst-io-{}-drop-hier.fst", std::process::id()));
+    let mut writer =
+        FstHierarchyWriter::new(File::create(&path).unwrap(), FstWriterOptions::default()).unwrap();
+    writer
+        .var(VarType::Wire, VarDirection::Implicit, b"a", 1)
+        .unwrap();
+    drop(writer);
+    let reader = FstReader::open(FstInput::open_path(&path).unwrap()).unwrap();
+    assert_eq!(reader.geometry(), [VariableLength::Bits(1)]);
+
+    let mut writer =
+        FstHierarchyWriter::new(File::create(&path).unwrap(), FstWriterOptions::default()).unwrap();
+    let a = writer
+        .var(VarType::Wire, VarDirection::Implicit, b"a", 1)
+        .unwrap();
+    let mut values = writer.into_values().unwrap();
+    values.time(3).unwrap();
+    values.change_bit(a, true).unwrap();
+    drop(values);
+    let reader = FstReader::open(FstInput::open_path(&path).unwrap()).unwrap();
+    assert_eq!(changes_of(&reader)[0], [(3, b"1".to_vec())]);
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn format_enums_match_the_type_names() {
+    for (i, &var_type) in VarType::ALL.iter().enumerate() {
+        assert_eq!(var_type as usize, i);
+        assert_eq!(VarType::from_u8(i as u8), Some(var_type));
+        assert!(var_type_name(i as u8).is_some());
+    }
+    assert_eq!(VarType::from_u8(VarType::ALL.len() as u8), None);
+    assert_eq!(VarType::ALL.len(), usize::from(TAG_VAR_MAX) + 1);
+    assert!(is_real_var_type(VarType::ShortReal as u8));
+    assert_eq!(VarType::Port as u8, VAR_TYPE_PORT);
+
+    for (i, &scope_type) in ScopeType::ALL.iter().enumerate() {
+        assert_eq!(scope_type as usize, i);
+        assert_eq!(ScopeType::from_u8(i as u8), Some(scope_type));
+    }
+    assert_eq!(ScopeType::SvArray as u8, 22);
+    for (i, &direction) in VarDirection::ALL.iter().enumerate() {
+        assert_eq!(direction as usize, i);
+        assert!(var_direction_name(i as u8).is_some());
+    }
+    assert_eq!(AttributeType::Pack as u8, 3);
+    assert_eq!(FileType::VerilogVhdl as u8, 2);
 }

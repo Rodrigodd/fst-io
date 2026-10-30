@@ -1056,6 +1056,126 @@ fn visit_hierarchy_entry(
     Ok(())
 }
 
+/// Defines a `#[repr(u8)]` enum whose discriminants run from 0 in
+/// declaration order, with `ALL` and `from_u8`.
+macro_rules! format_enum {
+    ($(#[$meta:meta])* $name:ident { $($(#[$variant_meta:meta])* $variant:ident,)* }) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[repr(u8)]
+        pub enum $name {
+            $($(#[$variant_meta])* $variant,)*
+        }
+
+        impl $name {
+            /// Every variant, in discriminant order.
+            pub const ALL: &[$name] = &[$($name::$variant,)*];
+
+            pub fn from_u8(value: u8) -> Option<$name> {
+                Self::ALL.get(usize::from(value)).copied()
+            }
+        }
+    };
+}
+
+format_enum! {
+    /// A scope type (FST_ST_*).
+    ScopeType {
+        Module,
+        Task,
+        Function,
+        Begin,
+        Fork,
+        Generate,
+        Struct,
+        Union,
+        Class,
+        Interface,
+        Package,
+        Program,
+        VhdlArchitecture,
+        VhdlProcedure,
+        VhdlFunction,
+        VhdlRecord,
+        VhdlProcess,
+        VhdlBlock,
+        VhdlForGenerate,
+        VhdlIfGenerate,
+        VhdlGenerate,
+        VhdlPackage,
+        SvArray,
+    }
+}
+
+format_enum! {
+    /// A variable type (FST_VT_*).
+    VarType {
+        Event,
+        Integer,
+        Parameter,
+        Real,
+        RealParameter,
+        Reg,
+        Supply0,
+        Supply1,
+        Time,
+        Tri,
+        TriAnd,
+        TriOr,
+        TriReg,
+        Tri0,
+        Tri1,
+        WAnd,
+        Wire,
+        WOr,
+        Port,
+        SparseArray,
+        RealTime,
+        /// A variable-length string.
+        String,
+        Bit,
+        Logic,
+        Int,
+        ShortInt,
+        LongInt,
+        Byte,
+        Enum,
+        /// Written as a 64-bit real, like the other real types.
+        ShortReal,
+    }
+}
+
+format_enum! {
+    /// A variable direction (FST_VD_*).
+    VarDirection {
+        Implicit,
+        Input,
+        Output,
+        InOut,
+        Buffer,
+        Linkage,
+    }
+}
+
+format_enum! {
+    /// An attribute type (FST_AT_*).
+    AttributeType {
+        Misc,
+        Array,
+        Enum,
+        Pack,
+    }
+}
+
+format_enum! {
+    /// The source language of a design (FST_FT_*).
+    FileType {
+        Verilog,
+        Vhdl,
+        VerilogVhdl,
+    }
+}
+
 /// Name of a variable type (FST_VT_*), or `None` if unknown.
 pub fn var_type_name(var_type: u8) -> Option<&'static str> {
     const NAMES: [&str; 30] = [
@@ -3335,5 +3455,542 @@ impl<R: Read + Seek> SectionIterator<Take<R>> {
             len,
             data: &mut self.reader,
         }))
+    }
+}
+
+/// Options of [`FstHierarchyWriter`].
+#[derive(Debug, Clone)]
+pub struct FstWriterOptions {
+    /// Order of magnitude of the time unit: 0 = 1s, -9 = 1ns, etc.
+    pub timescale: i8,
+    /// `$timezero`: the offset added to every time.
+    pub timezero: i64,
+    pub file_type: FileType,
+    /// The header's simulator identifier, shorter than 128 bytes.
+    pub writer: Vec<u8>,
+    /// The header's date string, shorter than 26 bytes.
+    pub date: Vec<u8>,
+    /// A block is sealed at the first time change once this many bytes are
+    /// buffered (see [`BlockBuffer::len_bytes`]).
+    pub block_size: usize,
+    pub encode: EncodeOptions,
+}
+
+impl Default for FstWriterOptions {
+    fn default() -> FstWriterOptions {
+        FstWriterOptions {
+            timescale: -9,
+            timezero: 0,
+            file_type: FileType::Verilog,
+            writer: b"fst-io".to_vec(),
+            date: Vec::new(),
+            block_size: 64 << 20,
+            encode: EncodeOptions::default(),
+        }
+    }
+}
+
+/// The first phase of writing an FST file: declaring scopes, variables and
+/// attributes. [`into_values`](Self::into_values) moves on to the values.
+///
+/// Dropping the writer finishes the file as one with no value changes,
+/// ignoring errors; call [`into_values`](Self::into_values) and
+/// [`FstValueWriter::finish`] to see them.
+pub struct FstHierarchyWriter<W: Write + Seek> {
+    out: Option<W>,
+    options: FstWriterOptions,
+    hierarchy: Vec<u8>,
+    geometry: Vec<VariableLength>,
+    num_scopes: u64,
+    num_hierarchy_vars: u64,
+    open_scopes: usize,
+}
+
+impl<W: Write + Seek> FstHierarchyWriter<W> {
+    /// Starts a file written to `out`. Nothing is written until
+    /// [`into_values`](Self::into_values).
+    pub fn new(out: W, options: FstWriterOptions) -> std::io::Result<FstHierarchyWriter<W>> {
+        if options.writer.len() >= 128 {
+            return Err(invalid_input(
+                "writer string must be shorter than 128 bytes",
+            ));
+        }
+        if options.date.len() >= 26 {
+            return Err(invalid_input("date string must be shorter than 26 bytes"));
+        }
+        Ok(FstHierarchyWriter {
+            out: Some(out),
+            options,
+            hierarchy: Vec::new(),
+            geometry: Vec::new(),
+            num_scopes: 0,
+            num_hierarchy_vars: 0,
+            open_scopes: 0,
+        })
+    }
+
+    /// Enters a new scope, closed by [`upscope`](Self::upscope).
+    pub fn scope(
+        &mut self,
+        scope_type: ScopeType,
+        name: &[u8],
+        component: &[u8],
+    ) -> std::io::Result<()> {
+        self.entry(&HierarchyEntry::Scope {
+            scope_type: scope_type as u8,
+            name: name.to_vec(),
+            component: component.to_vec(),
+        })
+        .map(drop)
+    }
+
+    pub fn upscope(&mut self) -> std::io::Result<()> {
+        self.entry(&HierarchyEntry::UpScope).map(drop)
+    }
+
+    /// Declares a variable in the current scope and returns its handle.
+    ///
+    /// `length` is in bits. The real types and [`VarType::String`] take their
+    /// geometry from the type and ignore it; any other variable of length 0
+    /// is variable-length. A [`VarType::Port`] length is stored as given.
+    pub fn var(
+        &mut self,
+        var_type: VarType,
+        direction: VarDirection,
+        name: &[u8],
+        length: u32,
+    ) -> std::io::Result<FstSignalHandle> {
+        let entry = var_entry(var_type, direction, name, length, None);
+        Ok(self.entry(&entry)?.expect("a variable has a handle"))
+    }
+
+    /// Declares a variable that shares the values of `of`, and returns `of`.
+    pub fn alias(
+        &mut self,
+        var_type: VarType,
+        direction: VarDirection,
+        name: &[u8],
+        length: u32,
+        of: FstSignalHandle,
+    ) -> std::io::Result<FstSignalHandle> {
+        let entry = var_entry(var_type, direction, name, length, Some(of));
+        Ok(self.entry(&entry)?.expect("a variable has a handle"))
+    }
+
+    /// Begins an attribute of the current scope. `subtype` is one of the
+    /// FST_*_* subtypes of `attr_type`; a [`AttributeType::Misc`] attribute
+    /// needs no [`attribute_end`](Self::attribute_end).
+    pub fn attribute_begin(
+        &mut self,
+        attr_type: AttributeType,
+        subtype: u8,
+        name: &[u8],
+        value: u64,
+    ) -> std::io::Result<()> {
+        self.entry(&HierarchyEntry::AttributeBegin {
+            attr_type: attr_type as u8,
+            subtype,
+            name: name.to_vec(),
+            value,
+        })
+        .map(drop)
+    }
+
+    pub fn attribute_end(&mut self) -> std::io::Result<()> {
+        self.entry(&HierarchyEntry::AttributeEnd).map(drop)
+    }
+
+    /// Writes an entry, such as one read from another file, and returns the
+    /// handle of a variable. A non-aliased variable gets the next handle
+    /// whatever its `id`; an alias's `id` must be a declared variable.
+    pub fn entry(&mut self, entry: &HierarchyEntry) -> std::io::Result<Option<FstSignalHandle>> {
+        let mut handle = None;
+        match entry {
+            HierarchyEntry::AttributeBegin { name, .. } => check_name(name)?,
+            HierarchyEntry::AttributeEnd => {}
+            HierarchyEntry::Scope {
+                name, component, ..
+            } => {
+                check_name(name)?;
+                check_name(component)?;
+                self.num_scopes += 1;
+                self.open_scopes += 1;
+            }
+            HierarchyEntry::UpScope => {
+                self.open_scopes = self
+                    .open_scopes
+                    .checked_sub(1)
+                    .ok_or_else(|| invalid_input("upscope without an open scope"))?;
+            }
+            &HierarchyEntry::Var {
+                var_type,
+                ref name,
+                length,
+                id,
+                is_alias,
+                ..
+            } => {
+                check_name(name)?;
+                if VarType::from_u8(var_type).is_none() {
+                    return Err(invalid_input("unknown variable type"));
+                }
+                if is_alias {
+                    if id >= self.geometry.len() as u64 {
+                        return Err(invalid_input("alias of an undeclared variable"));
+                    }
+                    handle = Some(FstSignalHandle::from_index(id as usize));
+                } else {
+                    let geometry = if is_real_var_type(var_type) {
+                        VariableLength::Real
+                    } else if length == 0 {
+                        VariableLength::VarLen
+                    } else if length < 0xFFFF_FFFF {
+                        VariableLength::Bits(length)
+                    } else {
+                        return Err(invalid_input("variable length too large"));
+                    };
+                    if self.geometry.len() >= (u32::MAX - 1) as usize {
+                        return Err(invalid_input("too many variables"));
+                    }
+                    self.geometry.push(geometry);
+                    handle = Some(FstSignalHandle::from_index(self.geometry.len() - 1));
+                }
+                self.num_hierarchy_vars += 1;
+            }
+        }
+        entry.write_record(&mut self.hierarchy);
+        Ok(handle)
+    }
+
+    /// Writes the header, hierarchy and geometry, and moves on to the values.
+    pub fn into_values(mut self) -> std::io::Result<FstValueWriter<W>> {
+        self.start_values()
+    }
+
+    fn start_values(&mut self) -> std::io::Result<FstValueWriter<W>> {
+        let mut out = self.out.take().expect("only taken once");
+        let header = self.header();
+        write_section_header(&mut out, BlockType::Header as u8, HeaderBlock::LEN as u64)?;
+        out.write_all(&header.to_bytes())?;
+
+        let mut section = Vec::new();
+        encode_hierarchy_section(&self.hierarchy, &mut section);
+        out.write_all(&section)?;
+        encode_geometry_section(&self.geometry, &mut section);
+        out.write_all(&section)?;
+
+        FstValueWriter::new(out, header, &self.geometry, &self.options)
+    }
+
+    fn header(&self) -> HeaderBlock {
+        let mut writer = [0u8; 128];
+        writer[..self.options.writer.len()].copy_from_slice(&self.options.writer);
+        let mut date = [0u8; 26];
+        date[..self.options.date.len()].copy_from_slice(&self.options.date);
+        HeaderBlock {
+            start_time: 0,
+            end_time: 0,
+            real_endianness: RealEndianess::LittleEndian,
+            writer_memory_use: self.options.block_size as u64,
+            num_scopes: self.num_scopes,
+            num_hierarchy_vars: self.num_hierarchy_vars,
+            num_vars: self.geometry.len() as u64,
+            num_vc_blocks: 0,
+            timescale: self.options.timescale,
+            writer,
+            date,
+            reserved: [0; 93],
+            file_type: self.options.file_type as u8,
+            timezero: self.options.timezero,
+        }
+    }
+}
+
+impl<W: Write + Seek> Drop for FstHierarchyWriter<W> {
+    fn drop(&mut self) {
+        if self.out.is_some()
+            && let Ok(values) = self.start_values()
+        {
+            let _ = values.finish();
+        }
+    }
+}
+
+/// The hierarchy record of a variable declared through
+/// [`FstHierarchyWriter::var`] or [`FstHierarchyWriter::alias`]: reals are
+/// recorded with length 8 and strings with length 0, as libfst does.
+fn var_entry(
+    var_type: VarType,
+    direction: VarDirection,
+    name: &[u8],
+    length: u32,
+    alias_of: Option<FstSignalHandle>,
+) -> HierarchyEntry {
+    let length = if is_real_var_type(var_type as u8) {
+        8
+    } else if var_type == VarType::String {
+        0
+    } else {
+        u64::from(length)
+    };
+    HierarchyEntry::Var {
+        var_type: var_type as u8,
+        direction: direction as u8,
+        name: name.to_vec(),
+        length,
+        id: alias_of.map_or(0, |of| of.index() as u64),
+        is_alias: alias_of.is_some(),
+    }
+}
+
+fn check_name(name: &[u8]) -> std::io::Result<()> {
+    if name.contains(&0) {
+        return Err(invalid_input("name contains a NUL byte"));
+    }
+    Ok(())
+}
+
+/// Encodes a FST_BL_HIER_LZ4 section holding `records` into `out`,
+/// replacing its contents.
+fn encode_hierarchy_section(records: &[u8], out: &mut Vec<u8>) {
+    let mut compressed = vec![0; lz4_flex::block::get_maximum_output_size(records.len())];
+    let len = lz4_flex::block::compress_into(records, &mut compressed)
+        .expect("output is sized for the worst case");
+    out.clear();
+    write_section_header(out, BlockType::HierarchyLZ4 as u8, 8 + len as u64)
+        .expect("writing to a Vec does not fail");
+    out.extend_from_slice(&(records.len() as u64).to_be_bytes());
+    out.extend_from_slice(&compressed[..len]);
+}
+
+/// Encodes a geometry section into `out`, replacing its contents.
+fn encode_geometry_section(geometry: &[VariableLength], out: &mut Vec<u8>) {
+    let mut lengths = Vec::new();
+    for length in geometry {
+        write_varint(&mut lengths, length.to_geometry());
+    }
+    let mut scratch = Vec::new();
+    let data = zlib_if_smaller(&lengths, 9, &mut scratch).unwrap_or(&lengths);
+    out.clear();
+    write_section_header(out, BlockType::Geometry as u8, 16 + data.len() as u64)
+        .expect("writing to a Vec does not fail");
+    out.extend_from_slice(&(lengths.len() as u64).to_be_bytes());
+    out.extend_from_slice(&(geometry.len() as u64).to_be_bytes());
+    out.extend_from_slice(data);
+}
+
+/// Encodes a blackout section, the `$dumpoff`/`$dumpon` times, into `out`,
+/// replacing its contents.
+fn encode_blackout_section(blackouts: &[(u64, bool)], out: &mut Vec<u8>) {
+    let mut data = Vec::new();
+    write_varint(&mut data, blackouts.len() as u64);
+    let mut previous = 0;
+    for &(time, active) in blackouts {
+        data.push(u8::from(active));
+        write_varint(&mut data, time - previous);
+        previous = time;
+    }
+    out.clear();
+    write_section_header(out, BlockType::Blackout as u8, data.len() as u64)
+        .expect("writing to a Vec does not fail");
+    out.extend_from_slice(&data);
+}
+
+/// The second phase of writing an FST file: the value changes.
+///
+/// Changes are recorded at the current time, set by [`time`](Self::time);
+/// changes made before the first `time` call happen at the first time. Each
+/// change is checked against the signal's geometry and returns
+/// [`std::io::ErrorKind::InvalidInput`] when it does not fit. Blocks are
+/// sealed at a time change once [`FstWriterOptions::block_size`] bytes are
+/// buffered or after [`flush`](Self::flush).
+///
+/// Dropping the writer finishes the file, ignoring errors; call
+/// [`finish`](Self::finish) to see them.
+pub struct FstValueWriter<W: Write + Seek> {
+    out: Option<W>,
+    header: HeaderBlock,
+    block: BlockBuffer,
+    spare: Option<BlockBuffer>,
+    encoder: BlockEncoder,
+    section: Vec<u8>,
+    block_size: usize,
+    flush_pending: bool,
+    blackouts: Vec<(u64, bool)>,
+}
+
+impl<W: Write + Seek> FstValueWriter<W> {
+    fn new(
+        out: W,
+        header: HeaderBlock,
+        geometry: &[VariableLength],
+        options: &FstWriterOptions,
+    ) -> std::io::Result<FstValueWriter<W>> {
+        Ok(FstValueWriter {
+            out: Some(out),
+            header,
+            block: BlockBuffer::new(geometry)?,
+            spare: None,
+            encoder: BlockEncoder::new(options.encode),
+            section: Vec::new(),
+            block_size: options.block_size,
+            flush_pending: false,
+            blackouts: Vec::new(),
+        })
+    }
+
+    /// Advances to `time`. Going back in time is an error; repeating the
+    /// current time does nothing.
+    pub fn time(&mut self, time: u64) -> std::io::Result<()> {
+        match self.block.end_time() {
+            Some(last) if time < last => return Err(invalid_input("time goes backwards")),
+            Some(last) if time == last => return Ok(()),
+            Some(_) => {
+                let full = self.block.len_bytes() >= self.block_size;
+                if (self.flush_pending || full) && self.block.has_time_step() {
+                    self.seal()?;
+                }
+            }
+            None => {
+                self.header.start_time = time;
+                for blackout in &mut self.blackouts {
+                    blackout.0 = time;
+                }
+            }
+        }
+        self.block.push_time(time)
+    }
+
+    /// Records a value of any form the reader yields, so values read from
+    /// one file can be written to another as they are. [`Value::Real`] bytes
+    /// are written as they are, so they must be little-endian.
+    pub fn change(&mut self, handle: FstSignalHandle, value: Value<'_>) -> std::io::Result<()> {
+        self.block.change(handle, value)
+    }
+
+    /// Records a value of a 1-bit signal.
+    pub fn change_bit(&mut self, handle: FstSignalHandle, bit: bool) -> std::io::Result<()> {
+        self.block.change_bit(handle, bit)
+    }
+
+    /// Records the low `n` bits of `value`, for an n-bit signal with
+    /// `n <= 64`.
+    pub fn change_u64(&mut self, handle: FstSignalHandle, value: u64) -> std::io::Result<()> {
+        self.block.change_u64(handle, value)
+    }
+
+    /// See [`BlockBuffer::change_words32`].
+    pub fn change_words32(
+        &mut self,
+        handle: FstSignalHandle,
+        words: &[u32],
+    ) -> std::io::Result<()> {
+        self.block.change_words32(handle, words)
+    }
+
+    /// See [`BlockBuffer::change_words64`].
+    pub fn change_words64(
+        &mut self,
+        handle: FstSignalHandle,
+        words: &[u64],
+    ) -> std::io::Result<()> {
+        self.block.change_words64(handle, words)
+    }
+
+    /// See [`BlockBuffer::change_four_state`].
+    pub fn change_four_state(
+        &mut self,
+        handle: FstSignalHandle,
+        aval: &[u32],
+        bval: &[u32],
+    ) -> std::io::Result<()> {
+        self.block.change_four_state(handle, aval, bval)
+    }
+
+    pub fn change_f64(&mut self, handle: FstSignalHandle, value: f64) -> std::io::Result<()> {
+        self.block.change_f64(handle, value)
+    }
+
+    /// See [`BlockBuffer::change_ascii`].
+    pub fn change_ascii(&mut self, handle: FstSignalHandle, ascii: &[u8]) -> std::io::Result<()> {
+        self.block.change_ascii(handle, ascii)
+    }
+
+    pub fn change_var_len(&mut self, handle: FstSignalHandle, bytes: &[u8]) -> std::io::Result<()> {
+        self.block.change_var_len(handle, bytes)
+    }
+
+    /// Records a `$dumpoff` (`active == false`) or `$dumpon` at the current
+    /// time.
+    pub fn dump_active(&mut self, active: bool) {
+        let time = self.block.end_time().unwrap_or(0);
+        self.blackouts.push((time, active));
+    }
+
+    /// Seals the current block at the next time change.
+    pub fn flush(&mut self) -> std::io::Result<()> {
+        self.flush_pending = true;
+        Ok(())
+    }
+
+    /// Writes the last block and the blackout section, rewrites the header,
+    /// and returns the output.
+    pub fn finish(mut self) -> std::io::Result<W> {
+        let result = self.finish_file();
+        let out = self.out.take().expect("taken only by finish");
+        result.map(|()| out)
+    }
+
+    fn seal(&mut self) -> std::io::Result<()> {
+        let mut next = match self.spare.take() {
+            Some(next) => next,
+            None => BlockBuffer::new(&[])?,
+        };
+        self.block.start_next(&mut next)?;
+        let sealed = std::mem::replace(&mut self.block, next);
+        self.flush_pending = false;
+        let result = self.write_block(&sealed);
+        self.spare = Some(sealed);
+        result
+    }
+
+    fn write_block(&mut self, block: &BlockBuffer) -> std::io::Result<()> {
+        self.encoder.encode(block, &mut self.section)?;
+        let out = self.out.as_mut().expect("present until finished");
+        out.write_all(&self.section)?;
+        self.header.num_vc_blocks += 1;
+        Ok(())
+    }
+
+    fn finish_file(&mut self) -> std::io::Result<()> {
+        if self.block.end_time().is_none() {
+            self.time(0)?;
+        }
+        if self.block.has_time_step() {
+            let block = std::mem::replace(&mut self.block, BlockBuffer::new(&[])?);
+            let result = self.write_block(&block);
+            self.block = block;
+            result?;
+        }
+        self.header.end_time = self.block.end_time().expect("a time was pushed");
+
+        let out = self.out.as_mut().expect("present until finished");
+        if !self.blackouts.is_empty() {
+            encode_blackout_section(&self.blackouts, &mut self.section);
+            out.write_all(&self.section)?;
+        }
+        let end = out.stream_position()?;
+        out.seek(SeekFrom::Start(9))?;
+        out.write_all(&self.header.to_bytes())?;
+        out.seek(SeekFrom::Start(end))?;
+        out.flush()
+    }
+}
+
+impl<W: Write + Seek> Drop for FstValueWriter<W> {
+    fn drop(&mut self) {
+        if self.out.is_some() {
+            let _ = self.finish_file();
+        }
     }
 }
