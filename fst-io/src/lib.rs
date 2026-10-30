@@ -467,6 +467,17 @@ pub enum VariableLength {
     VarLen,
 }
 
+impl VariableLength {
+    /// The geometry block entry, the inverse of [`GeometryLengths`].
+    pub fn to_geometry(self) -> u64 {
+        match self {
+            VariableLength::Bits(bits) => bits,
+            VariableLength::Real => 0,
+            VariableLength::VarLen => 0xFFFF_FFFF,
+        }
+    }
+}
+
 /// The geometry data, decompressed if needed.
 pub enum GeometryData<R> {
     Raw(R),
@@ -534,6 +545,15 @@ fn read_varint<R: Read>(reader: &mut R) -> std::io::Result<u64> {
             return Ok(value);
         }
     }
+}
+
+/// Appends `value` as an unsigned LEB128 varint, the inverse of [`read_varint`].
+fn write_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value & 0x7F) as u8 | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
 }
 
 impl<R: Read> Section<R> {
@@ -1221,6 +1241,52 @@ pub enum HierarchyEntry {
     },
 }
 
+impl HierarchyEntry {
+    /// Appends the entry as a hierarchy record, the inverse of
+    /// [`HierarchyEntries::read_entry`].
+    ///
+    /// A non-aliased variable's `id` is not stored: readers number variables
+    /// in record order.
+    pub fn write_record(&self, out: &mut Vec<u8>) {
+        match self {
+            HierarchyEntry::AttributeBegin {
+                attr_type,
+                subtype,
+                name,
+                value,
+            } => {
+                out.extend_from_slice(&[TAG_ATTRIBUTE_BEGIN, *attr_type, *subtype]);
+                write_name(out, name);
+                write_varint(out, *value);
+            }
+            HierarchyEntry::AttributeEnd => out.push(TAG_ATTRIBUTE_END),
+            HierarchyEntry::Scope {
+                scope_type,
+                name,
+                component,
+            } => {
+                out.extend_from_slice(&[TAG_SCOPE, *scope_type]);
+                write_name(out, name);
+                write_name(out, component);
+            }
+            HierarchyEntry::UpScope => out.push(TAG_UPSCOPE),
+            HierarchyEntry::Var {
+                var_type,
+                direction,
+                name,
+                length,
+                id,
+                is_alias,
+            } => {
+                out.extend_from_slice(&[*var_type, *direction]);
+                write_name(out, name);
+                write_varint(out, *length);
+                write_varint(out, if *is_alias { id + 1 } else { 0 });
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for HierarchyEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
@@ -1374,6 +1440,12 @@ fn read_name<R: BufRead>(reader: &mut R) -> std::io::Result<Vec<u8>> {
         return Err(std::io::ErrorKind::UnexpectedEof.into());
     }
     Ok(name)
+}
+
+/// Appends a null terminated name, the inverse of [`read_name`].
+fn write_name(out: &mut Vec<u8>, name: &[u8]) {
+    out.extend_from_slice(name);
+    out.push(0);
 }
 
 impl<R: SectionData> Section<R> {

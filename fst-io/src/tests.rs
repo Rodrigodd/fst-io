@@ -1060,3 +1060,74 @@ fn read_value_changes_propagates_callback_error() {
     assert!(matches!(result, Err(ReadError::Callback("stop"))));
     std::fs::remove_file(&path).unwrap();
 }
+
+#[test]
+fn write_varint_is_read_back_by_read_varint() {
+    for value in [
+        0,
+        1,
+        127,
+        128,
+        300,
+        16_383,
+        16_384,
+        u64::from(u32::MAX),
+        u64::MAX,
+    ] {
+        let mut bytes = Vec::new();
+        write_varint(&mut bytes, value);
+        assert_eq!(bytes, varint(value), "{value}");
+        let mut reader = &bytes[..];
+        assert_eq!(read_varint(&mut reader).unwrap(), value);
+        assert!(reader.is_empty());
+    }
+}
+
+#[test]
+fn write_record_reproduces_the_hierarchy_records() {
+    let (data, entries) = sample_hierarchy();
+    let mut encoded = Vec::new();
+    for entry in &entries {
+        entry.write_record(&mut encoded);
+    }
+    assert_eq!(encoded, data);
+}
+
+#[test]
+fn write_record_ids_follow_record_order() {
+    let aliases = [0, 0, 0, 0, 2, 1, 0, 0, 6, 0];
+    let data: Vec<u8> = aliases
+        .iter()
+        .flat_map(|&alias| var("v", 1, alias))
+        .collect();
+    let entries: Vec<_> = HierarchyEntries::from_records(std::io::Cursor::new(&data[..]))
+        .map(Result::unwrap)
+        .collect();
+
+    let mut encoded = Vec::new();
+    for entry in &entries {
+        entry.write_record(&mut encoded);
+    }
+    assert_eq!(encoded, data);
+}
+
+#[test]
+fn to_geometry_is_read_back_by_geometry_lengths() {
+    let lengths = [
+        VariableLength::Bits(1),
+        VariableLength::Real,
+        VariableLength::VarLen,
+        VariableLength::Bits(300),
+        VariableLength::Bits(0xFFFF_FFFE),
+    ];
+    let mut data = Vec::new();
+    for length in lengths {
+        write_varint(&mut data, length.to_geometry());
+    }
+    let file = geometry(&data, lengths.len() as u64);
+
+    let mut iterator = SectionIterator::new(std::io::Cursor::new(file));
+    let geometry = iterator.next().unwrap().unwrap().read_geometry().unwrap();
+    let read: Vec<_> = geometry.lengths().map(Result::unwrap).collect();
+    assert_eq!(read, lengths);
+}
