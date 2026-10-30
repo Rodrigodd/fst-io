@@ -2477,8 +2477,8 @@ impl BlockBuffer {
             return Err(invalid_input("time index out of range"));
         }
         let last = self.last_change[handle.index()];
-        // A change at the current time index is never out of order, so only
-        // `change_at` reads the previous change back from the log.
+        // A change at the current time index is never out of order, so the
+        // previous change is only read back from the log for an earlier one.
         if time_index != self.current_index()
             && last != NO_CHANGE
             && self.changes[last as usize].time_index as usize > time_index
@@ -2486,6 +2486,23 @@ impl BlockBuffer {
             return Err(invalid_input("changes of a signal must be in time order"));
         }
         if u32::try_from(self.changes.len() + 1).is_err() {
+            return Err(invalid_input("too many changes in one block"));
+        }
+        Ok(length)
+    }
+
+    /// Like [`check`](Self::check), for a change at the current time index,
+    /// which needs no time-order check.
+    fn check_current(&self, handle: FstSignalHandle) -> std::io::Result<VariableLength> {
+        let length = *self
+            .layout
+            .geometry
+            .get(handle.index())
+            .ok_or_else(|| invalid_input("signal handle out of range"))?;
+        if !self.has_time_step() && !self.first {
+            return Err(invalid_input("time index out of range"));
+        }
+        if self.changes.len() >= NO_CHANGE as usize {
             return Err(invalid_input("too many changes in one block"));
         }
         Ok(length)
@@ -2540,7 +2557,8 @@ impl BlockBuffer {
     /// Records a value of any form the reader yields. [`Value::Real`] bytes
     /// are written as they are, so they must be little-endian.
     pub fn change(&mut self, handle: FstSignalHandle, value: Value<'_>) -> std::io::Result<()> {
-        self.change_at(self.current_index(), handle, value)
+        let length = self.check_current(handle)?;
+        self.push_value(self.current_index(), handle, length, value)
     }
 
     /// Like [`change`](Self::change), at an earlier time step of this block:
@@ -2554,6 +2572,16 @@ impl BlockBuffer {
         value: Value<'_>,
     ) -> std::io::Result<()> {
         let length = self.check(handle, time_index)?;
+        self.push_value(time_index, handle, length, value)
+    }
+
+    fn push_value(
+        &mut self,
+        time_index: usize,
+        handle: FstSignalHandle,
+        length: VariableLength,
+        value: Value<'_>,
+    ) -> std::io::Result<()> {
         match (length, value) {
             (VariableLength::Bits(1), Value::Bit(ascii) | Value::Ascii(&[ascii])) => {
                 self.push_bit(handle, time_index, ascii)
@@ -2592,9 +2620,17 @@ impl BlockBuffer {
 
     /// Records a value of a 1-bit signal.
     pub fn change_bit(&mut self, handle: FstSignalHandle, bit: bool) -> std::io::Result<()> {
-        let time_index = self.current_index();
-        match self.check(handle, time_index)? {
-            VariableLength::Bits(1) => self.push_bit(handle, time_index, b'0' | u8::from(bit)),
+        match self.check_current(handle)? {
+            VariableLength::Bits(1) => {
+                let ascii = b'0' | u8::from(bit);
+                self.push(
+                    handle,
+                    self.current_index(),
+                    ChangeForm::Bit,
+                    u32::from(ascii),
+                );
+                Ok(())
+            }
             _ => Err(invalid_input("value does not match the signal's length")),
         }
     }
@@ -2651,7 +2687,7 @@ impl BlockBuffer {
         bval: Option<&[u8]>,
     ) -> std::io::Result<()> {
         let time_index = self.current_index();
-        let VariableLength::Bits(n) = self.check(handle, time_index)? else {
+        let VariableLength::Bits(n) = self.check_current(handle)? else {
             return Err(invalid_input("value does not match the signal's length"));
         };
         let n = n as usize;
