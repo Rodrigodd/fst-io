@@ -2310,6 +2310,13 @@ struct BufferedChange {
 
 const NO_CHANGE: u32 = u32::MAX;
 
+const PLACEHOLDER_CHANGE: BufferedChange = BufferedChange {
+    handle: 0,
+    time_index: 0,
+    data: 0,
+    form: ChangeForm::Bit,
+};
+
 /// Everything one value-change section holds before encoding: the frame (the
 /// value of every signal at the block's first time), the time table, and the
 /// changes, kept in the form they were given.
@@ -2820,8 +2827,8 @@ pub struct BlockEncoder {
     /// `order[starts[i]..starts[i + 1]]` are the changes of signal `i`.
     starts: Vec<u32>,
     cursor: Vec<u32>,
-    /// Change indices, grouped by signal and in time order within each.
-    order: Vec<u32>,
+    /// The block's changes, grouped by signal and in time order within each.
+    order: Vec<BufferedChange>,
     value: Vec<u8>,
     previous: Vec<u8>,
     /// The uncompressed waves stored so far, to find dynamic aliases.
@@ -2932,10 +2939,10 @@ impl BlockEncoder {
         self.cursor.clear();
         self.cursor.extend_from_slice(&self.starts[..count]);
         self.order.clear();
-        self.order.resize(block.changes.len(), 0);
-        for (index, change) in block.changes.iter().enumerate() {
+        self.order.resize(block.changes.len(), PLACEHOLDER_CHANGE);
+        for change in &block.changes {
             let slot = &mut self.cursor[change.handle as usize];
-            self.order[*slot as usize] = index as u32;
+            self.order[*slot as usize] = *change;
             *slot += 1;
         }
     }
@@ -3038,10 +3045,9 @@ impl BlockEncoder {
 
         let mut previous_index = 0u64;
         let order = &self.order[changes];
-        for (i, &index) in order.iter().enumerate() {
-            let change = block.changes[index as usize];
-            if let Some(&next) = order.get(i + 1)
-                && block.changes[next as usize].time_index == change.time_index
+        for (i, &change) in order.iter().enumerate() {
+            if let Some(next) = order.get(i + 1)
+                && next.time_index == change.time_index
             {
                 continue;
             }
