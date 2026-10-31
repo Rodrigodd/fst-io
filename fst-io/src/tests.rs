@@ -1460,6 +1460,51 @@ fn long_waves_are_lz4_compressed_when_it_shrinks_them() {
 }
 
 #[test]
+fn frame_decodes_the_same_at_every_compression_level() {
+    let geometry = vec![VariableLength::Bits(8); 64];
+    let mut block = BlockBuffer::new(&geometry).unwrap();
+    block.push_time(0).unwrap();
+    block.change_u64(handle(3), 0x5a).unwrap();
+    let mut next = BlockBuffer::new(&[VariableLength::Bits(1)]).unwrap();
+    block.start_next(&mut next).unwrap();
+    next.push_time(1).unwrap();
+
+    let encoded: Vec<Vec<u8>> = (0..=9)
+        .map(|level| {
+            encode_block(
+                &next,
+                EncodeOptions {
+                    frame_compression_level: level,
+                    ..EncodeOptions::default()
+                },
+            )
+        })
+        .collect();
+    assert!(
+        encoded[1..]
+            .iter()
+            .all(|bytes| bytes.len() < encoded[0].len())
+    );
+    let frame = decode_block(&encoded[0], &geometry).frame;
+    assert_eq!(frame[3], b"01011010");
+    for bytes in &encoded[1..] {
+        assert_eq!(decode_block(bytes, &geometry).frame, frame);
+    }
+}
+
+#[test]
+fn writer_refuses_a_frame_compression_level_above_nine() {
+    let options = FstWriterOptions {
+        encode: EncodeOptions {
+            frame_compression_level: 10,
+            ..EncodeOptions::default()
+        },
+        ..FstWriterOptions::default()
+    };
+    assert!(FstHierarchyWriter::new(std::io::Cursor::new(Vec::new()), options).is_err());
+}
+
+#[test]
 fn time_table_and_frame_are_compressed_only_when_strictly_smaller() {
     let geometry = [VariableLength::Bits(1)];
     let mut small = BlockBuffer::new(&geometry).unwrap();

@@ -2955,13 +2955,27 @@ pub enum WaveCompression {
 }
 
 /// Options of [`BlockEncoder`].
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct EncodeOptions {
     /// Drop a change equal to the signal's previous value. Changes at the
     /// file's first time step are always kept, so it lists every signal set
     /// there. Variable-length values are never dropped.
     pub deduplicate: bool,
     pub wave_compression: WaveCompression,
+    /// zlib level, 0 to 9, of each block's frame. The frame is stored raw
+    /// when zlib does not shrink it, which is always the case at 0. The
+    /// default, 4, is libfst's.
+    pub frame_compression_level: u32,
+}
+
+impl Default for EncodeOptions {
+    fn default() -> EncodeOptions {
+        EncodeOptions {
+            deduplicate: false,
+            wave_compression: WaveCompression::default(),
+            frame_compression_level: 4,
+        }
+    }
 }
 
 /// Encodes [`BlockBuffer`]s as value-change sections, reusing its scratch
@@ -3048,7 +3062,12 @@ impl BlockEncoder {
         let memory_required_at = out.len();
         out.extend_from_slice(&[0; 8]);
 
-        let frame = zlib_if_smaller(&block.frame, 4, &mut self.zlib).unwrap_or(&block.frame);
+        let frame = zlib_if_smaller(
+            &block.frame,
+            self.options.frame_compression_level,
+            &mut self.zlib,
+        )
+        .unwrap_or(&block.frame);
         write_varint(out, block.frame.len() as u64);
         write_varint(out, frame.len() as u64);
         write_varint(out, count);
@@ -3809,6 +3828,9 @@ impl<W: Write + Seek + Send + 'static> FstHierarchyWriter<W> {
         }
         if options.threads > 0 && options.max_blocks_in_flight == 0 {
             return Err(invalid_input("max_blocks_in_flight must be at least 1"));
+        }
+        if options.encode.frame_compression_level > 9 {
+            return Err(invalid_input("frame_compression_level must be at most 9"));
         }
         Ok(FstHierarchyWriter {
             out: Some(out),

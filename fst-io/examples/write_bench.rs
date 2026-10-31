@@ -8,7 +8,7 @@
 //! ```sh
 //! cargo run --release -p fst-io --example write_bench -- [--threads N]
 //!     [--steps N (default 1000000)] [--block-size BYTES] [--dedup]
-//!     [--output PATH]
+//!     [--frame-level 0-9] [--output PATH]
 //! ```
 //!
 //! Without `--output` the file is written to a sink that only counts bytes.
@@ -92,6 +92,7 @@ struct Args {
     steps: usize,
     block_size: usize,
     deduplicate: bool,
+    frame_level: u32,
     output: Option<String>,
 }
 
@@ -101,6 +102,7 @@ fn parse_args() -> Args {
         steps: 1_000_000,
         block_size: FstWriterOptions::default().block_size,
         deduplicate: false,
+        frame_level: EncodeOptions::default().frame_compression_level,
         output: None,
     };
     let mut iter = std::env::args().skip(1);
@@ -113,6 +115,9 @@ fn parse_args() -> Args {
                 args.block_size = value().parse().expect("--block-size takes a number")
             }
             "--dedup" => args.deduplicate = true,
+            "--frame-level" => {
+                args.frame_level = value().parse().expect("--frame-level takes a number")
+            }
             "--output" => args.output = Some(value()),
             _ => panic!("unknown option {arg}"),
         }
@@ -248,6 +253,7 @@ fn run<W: Write + Seek + Send + 'static>(out: W, args: &Args) -> std::io::Result
         block_size: args.block_size,
         encode: EncodeOptions {
             deduplicate: args.deduplicate,
+            frame_compression_level: args.frame_level,
             ..EncodeOptions::default()
         },
         ..FstWriterOptions::default()
